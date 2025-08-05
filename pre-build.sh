@@ -3,18 +3,19 @@ set -e
 
 echo "=== Запуск pre-build.sh ==="
 
-# Проверяем, что директория openvpn существует
-if [ ! -d "padavan-ng/trunk/user/openvpn/openvpn-2.6.13" ]; then
-    echo "Ошибка: не найден каталог padavan-ng/trunk/user/openvpn/openvpn-2.6.13"
+OPENVPN_DIR="padavan-ng/trunk/user/openvpn/openvpn-2.6.13"
+
+# Проверяем наличие каталога
+if [ ! -d "$OPENVPN_DIR" ]; then
+    echo "Ошибка: не найден каталог $OPENVPN_DIR"
     exit 1
 fi
 
-echo "Применяю XOR-патч..."
+echo "Применяю XOR-патч к OpenVPN 2.6.13..."
 
-patch -p1 -d padavan-ng <<'EOF'
-diff -Naur a/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/forward.c b/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/forward.c
---- a/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/forward.c
-+++ b/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/forward.c
+patch -d "$OPENVPN_DIR" -p1 <<'EOF'
+--- src/openvpn/forward.c
++++ src/openvpn/forward.c
 @@ -750,7 +750,10 @@
      status = link_socket_read(c->c2.link_socket,
                                &c->c2.buf,
@@ -23,21 +24,9 @@ diff -Naur a/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/forward.c b/trunk/use
 +                              c->options.ce.xormethod,
 +                              c->options.ce.xormask,
 +                              c->options.ce.xormasklen);
- 
-     if (socket_connection_reset(c->c2.link_socket, status))
-     {
-@@ -1400,7 +1403,10 @@
-                 size = link_socket_write(c->c2.link_socket,
-                                          &c->c2.to_link,
--                                         to_addr);
-+                                         to_addr,
-+                                         c->options.ce.xormethod,
-+                                         c->options.ce.xormask,
-+                                         c->options.ce.xormasklen);
 
-diff -Naur a/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/options.c b/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/options.c
---- a/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/options.c
-+++ b/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/options.c
+--- src/openvpn/options.c
++++ src/openvpn/options.c
 @@ -850,6 +850,9 @@
      o->resolve_retry_seconds = RESOLV_RETRY_INFINITE;
      o->resolve_in_advance = false;
@@ -47,11 +36,9 @@ diff -Naur a/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/options.c b/trunk/use
 +    o->ce.xormasklen = 1;
 
 @@ -6100,6 +6103,36 @@
-         options->proto_force = proto_force;
-     }
-+    else if (streq(p[0], "scramble"))
-+    {
-+        VERIFY_PERMISSION(OPT_P_GENERAL|OPT_P_CONNECTION);
+     else if (streq(p[0], "scramble"))
+     {
+         VERIFY_PERMISSION(OPT_P_GENERAL|OPT_P_CONNECTION);
 +        if (streq(p[1], "xormask"))
 +        {
 +            options->ce.xormethod = 1;
@@ -80,9 +67,8 @@ diff -Naur a/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/options.c b/trunk/use
 +        }
 +    }
 
-diff -Naur a/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/options.h b/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/options.h
---- a/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/options.h
-+++ b/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/options.h
+--- src/openvpn/options.h
++++ src/openvpn/options.h
 @@ -120,6 +120,9 @@
      int connect_retry_seconds;
      int connect_retry_seconds_max;
@@ -91,13 +77,12 @@ diff -Naur a/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/options.h b/trunk/use
 +    const char *xormask;
 +    int xormasklen;
 
-diff -Naur a/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/socket.c b/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/socket.c
---- a/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/socket.c
-+++ b/trunk/user/openvpn/openvpn-2.6.13/src/openvpn/socket.c
+--- src/openvpn/socket.c
++++ src/openvpn/socket.c
 @@ -60,6 +60,47 @@
      IPv6_TCP_HEADER_SIZE,
  };
- 
+
 +int buffer_mask(struct buffer *buf, const char *mask, int xormasklen)
 +{
 +    int i;
