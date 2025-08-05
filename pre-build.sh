@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e
-OVPN_VER=2.6.13
+OVPN_VER=2.6.14
 PATCHED_URL="https://github.com/luzrain/openvpn-xorpatch/releases/download/v${OVPN_VER}/openvpn-${OVPN_VER}.tar.gz"
 
 cd padavan-ng/trunk/user/openvpn
