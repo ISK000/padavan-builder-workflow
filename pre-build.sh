@@ -1,14 +1,8 @@
 #!/usr/bin/env bash
 set -e
+OVPN_VER=2.6.13
+PATCHED_URL="https://github.com/luzrain/openvpn-xorpatch/releases/download/v${OVPN_VER}/openvpn-${OVPN_VER}.tar.gz"
 
-PATCH_DIR="${GITHUB_WORKSPACE}/patches"
-
-# !!! Переходим прямо в исходники OpenVPN
-cd padavan-ng/trunk/user/openvpn/openvpn-2.6.13
-
-for p in "${PATCH_DIR}"/0*-tunnelblick-openvpn_xorpatch-*.diff; do
-    echo ">>> Патчим $(basename "$p")"
-    # -p1   – срезаем "openvpn-2.6.x.old/"
-    # -t    – падаем, если хунк не применился
-    patch -p1 -t < "$p"
-done
+cd padavan-ng/trunk/user/openvpn
+echo ">> Подменяем архив OpenVPN ${OVPN_VER} на версию с XOR"
+curl -L -o openvpn-${OVPN_VER}.tar.gz "${PATCHED_URL}"
