@@ -13,3 +13,5 @@ do
 done
 
 rm -f padavan-ng/trunk/dl/openvpn-${OVPN_VER}.tar.* || true
+echo ">> wipe pre-built toolchain to match source timestamps"
+rm -rf padavan-ng/toolchain/out 2>/dev/null || true
