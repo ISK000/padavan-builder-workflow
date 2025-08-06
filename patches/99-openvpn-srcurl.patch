@@ -1,0 +1,5 @@
+--- a/user/openvpn/Makefile
++++ b/user/openvpn/Makefile
+@@
+-SRC_URL=https://github.com/OpenVPN/openvpn/archive/refs/tags/v2.6.14.tar.gz
++SRC_URL=https://github.com/luzrain/openvpn-xorpatch/releases/download/v2.6.14/openvpn-2.6.14.tar.gz
