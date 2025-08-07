@@ -36,4 +36,18 @@ for dir in "${OPENVPN_DIRS[@]}"; do
     sed -i '/openvpn-orig\.patch/s|^[^\t#]|#&|'                 "${mf}"
 done
 
+
+CUSTOM_MODEL="FastLink  (private build)"
+CUSTOM_FOOTER="© 2025 FastLink Team.  Powered by Padavan-NG"
+
+sed -i "
+  s/^Web_Title=.*/Web_Title=ZVMODELVZ Wireless Router/;
+" padavan-ng/trunk/romfs/www/*.dict   2>/dev/null || true
+
+# заменим placeholder на свои строки
+find padavan-ng/trunk -name '*.dict' -print0 | while IFS= read -r -d '' F; do
+  sed -i "s/ZVMODELVZ/${CUSTOM_MODEL//\//\\/}/g"   "$F"
+  sed -i "s/ZVCOPYRVZ/${CUSTOM_FOOTER//\//\\/}/g"  "$F"
+done
+
 echo ">>> prebuild.sh finished OK"
