@@ -7,25 +7,25 @@ v${OVPN_VER}/openvpn-${OVPN_VER}.tar.gz"
 
 for dir in padavan-ng/trunk/user/openvpn \
            padavan-ng/trunk/user/openvpn-openssl; do
-    mf="$dir/Makefile"          || continue
+    mf="$dir/Makefile"       || continue
     [[ -f $mf ]] || continue
-    echo ">> patching $mf"
+    echo ">>> patching $mf"
 
-    # берём уже-пропатчённые исходники
+    # 1) берём уже-пропатчённый архив
     sed -i "s|^SRC_NAME=.*|SRC_NAME=openvpn-${OVPN_VER}|" "$mf"
-    sed -i "s|^SRC_URL=.*|SRC_URL=${SRC_URL}|"          "$mf"
+    sed -i "s|^SRC_URL=.*|SRC_URL=${SRC_URL}|"            "$mf"
 
-    # ключ нужен, ничего не убираем
+    # 2) включаем xor-patch при конфигурации (если строки ещё нет)
     if ! grep -q -- '--enable-xor-patch' "$mf"; then
-        sed -i '/--enable-small/a \ \t--enable-xor-patch \\' "$mf"
+        sed -i 's|--enable-small|--enable-small \\\n\t--enable-xor-patch|' "$mf"
     fi
 
-    # гасим openvpn-orig.patch — теперь он не нужен
-    sed -i '/openvpn-orig\.patch/s|^[^#]|#&|' "$mf"
+    # 3) возвращаем autoreconf, если его закомментировали
+    sed -i 's|^.*true # autoreconf disabled.*$|autoreconf -fi |' "$mf"
 
-    # *** главное ***  убираем autoreconf, чтобы не перегенерировать configure
-    sed -i 's/autoreconf -fi/true # autoreconf disabled (xorpatch)/' "$mf"
+    # 4) не трогаем openvpn-orig.patch
+    sed -i '/openvpn-orig\.patch/s|^[^#]|#&|' "$mf"
 done
 
-# стираем старый архив, если успел скачаться
+# Удаляем старый дистфайл, если он уже лежит в dl/
 rm -f padavan-ng/trunk/dl/openvpn-${OVPN_VER}.tar.* 2>/dev/null || true
