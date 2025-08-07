@@ -2,28 +2,26 @@
 set -e
 
 OVPN_VER=2.6.14
-PATCH_URL="https://github.com/luzrain/openvpn-xorpatch/releases/download/v${OVPN_VER}/openvpn-${OVPN_VER}.tar.gz"
+BASE_URL="https://github.com/OpenVPN/openvpn/archive/refs/tags/v${OVPN_VER}.tar.gz"
+PATCH_URL="https://raw.githubusercontent.com/luzrain/openvpn-xorpatch/master/patches/openvpn-${OVPN_VER}.patch"
 
 for dir in padavan-ng/trunk/user/openvpn \
            padavan-ng/trunk/user/openvpn-openssl; do
-    mf="$dir/Makefile"
+    mf="${dir}/Makefile" || continue
     [[ -f $mf ]] || continue
-    echo ">> patching $mf"
 
-    # 1. архив и каталог
-    sed -i "s|^SRC_NAME=.*|SRC_NAME=openvpn-${OVPN_VER}|" "$mf"
-    sed -i "s|^SRC_URL=.*|SRC_URL=${PATCH_URL}|"          "$mf"
+    sed -i \
+        -e "s|^SRC_NAME=.*|SRC_NAME=openvpn-${OVPN_VER}|" \
+        -e "s|^SRC_URL=.*|SRC_URL=${BASE_URL}|"          \
+        "$mf"
 
-    # 2. удаляем ВСЕ старые вставки xor-patch и лишние обратные слэши
-    sed -i '/--enable-xor-patch/d' "$mf"
-    sed -i '/^[[:space:]]*\\[[:space:]]*$/d' "$mf"
+    # === добавляем накатывание патча =========================
+    sed -i "/tar -xf/s|$| \\\
+\t\t&& wget -qO- ${PATCH_URL} | patch -d \$(SRC_NAME) -p1|" "$mf"
 
-    # 3. перезаписываем строку с --enable-small одной корректной версией
-    sed -i 's|--enable-small[[:space:]]*\\|--enable-small --enable-xor-patch \\|' "$mf"
-
-    # 4. комментируем возможный openvpn-orig.patch
-    sed -i '/openvpn-orig\.patch/ s|^[[:space:]]*|# &|' "$mf"
+    # подстрахуемся и раскомментируем возможную старую строку
+    sed -i '/openvpn-orig\.patch/s|^#||' "$mf"
 done
 
-# 5. гарантируем повторную загрузку архива
-rm -f padavan-ng/trunk/dl/openvpn-${OVPN_VER}.tar.* || true
+# старые архивы – в корзину
+rm -f padavan-ng/trunk/dl/openvpn-${OVPN_VER}.tar.* 2>/dev/null || true
