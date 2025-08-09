@@ -50,4 +50,23 @@ find padavan-ng/trunk -name '*.dict' -print0 | while IFS= read -r -d '' F; do
   sed -i "s/ZVCOPYRVZ/${CUSTOM_FOOTER//\//\\/}/g"  "$F"
 done
 
+
+# ----------------------------------------------------------------------
+# Принудительно WAN = eth2 для Mi 4A Gigabit (CN)
+# ----------------------------------------------------------------------
+DEF="padavan-ng/trunk/user/shared/defaults.c"
+SS="padavan-ng/trunk/user/scripts/started_script.sh"
+
+if [ -f "$DEF" ]; then
+    sed -i 's/{ *"wan_ifname", *IFNAME_WAN *}/{ "wan_ifname", "eth2" }/' "$DEF"
+    echo ">>> WAN интерфейс по умолчанию изменён на eth2"
+else
+    echo "!!! defaults.c не найден — проверь путь !!!"
+fi
+
+if [ -f "$SS" ]; then
+    grep -q 'delif br0 eth2' "$SS" || echo 'brctl delif br0 eth2 2>/dev/null' >> "$SS"
+    echo ">>> Скрипт старта дополнен удалением eth2 из LAN моста"
+fi
+
 echo ">>> prebuild.sh finished OK"
