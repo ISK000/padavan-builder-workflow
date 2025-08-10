@@ -51,22 +51,38 @@ find padavan-ng/trunk -name '*.dict' -print0 | while IFS= read -r -d '' F; do
 done
 
 
-# ----------------------------------------------------------------------
-# Принудительно WAN = eth2 для Mi 4A Gigabit (CN)
-# ----------------------------------------------------------------------
-DEF="padavan-ng/trunk/user/shared/defaults.c"
-SS="padavan-ng/trunk/user/scripts/started_script.sh"
 
+# =========================
+# 3. WAN = eth2 + карта портов MT7530
+# =========================
+
+# Поправляем defaults.c
+DEF="padavan-ng/trunk/user/shared/defaults.c"
 if [ -f "$DEF" ]; then
     sed -i 's/{ *"wan_ifname", *IFNAME_WAN *}/{ "wan_ifname", "eth2" }/' "$DEF"
-    echo ">>> WAN интерфейс по умолчанию изменён на eth2"
-else
-    echo "!!! defaults.c не найден — проверь путь !!!"
+    sed -i 's/{ *"wan0_ifname", *IFNAME_WAN *}/{ "wan0_ifname", "eth2" }/' "$DEF"
+    sed -i 's/{ *"wan_proto", *"dhcp" *}/{ "wan_proto", "dhcp" }/' "$DEF"
+    sed -i 's/{ *"wan0_proto", *"dhcp" *}/{ "wan0_proto", "dhcp" }/' "$DEF"
+    sed -i 's/{ *"lan_ifnames", *".*" *}/{ "lan_ifnames", "eth0 ra0 rai0" }/' "$DEF"
+    echo ">>> defaults.c обновлён под eth2"
 fi
 
-if [ -f "$SS" ]; then
-    grep -q 'delif br0 eth2' "$SS" || echo 'brctl delif br0 eth2 2>/dev/null' >> "$SS"
-    echo ">>> Скрипт старта дополнен удалением eth2 из LAN моста"
+# Поправляем board.h (число LAN-портов)
+BH="padavan-ng/trunk/configs/boards/XIAOMI/MI-R3Gv2/board.h"
+if [ -f "$BH" ]; then
+    sed -i 's/#define BOARD_NUM_ETH_EPHY.*/#define BOARD_NUM_ETH_EPHY 2/' "$BH"
+    echo ">>> board.h — число LAN портов = 2"
+fi
+
+# Поправляем kernel config (карта портов)
+KC="padavan-ng/trunk/configs/boards/XIAOMI/MI-R3Gv2/kernel-3.4.x.config"
+if [ -f "$KC" ]; then
+    sed -i 's/CONFIG_RAETH_ESW_PORT_WAN=.*/CONFIG_RAETH_ESW_PORT_WAN=0/' "$KC"
+    sed -i 's/CONFIG_RAETH_ESW_PORT_LAN1=.*/CONFIG_RAETH_ESW_PORT_LAN1=1/' "$KC"
+    sed -i 's/CONFIG_RAETH_ESW_PORT_LAN2=.*/CONFIG_RAETH_ESW_PORT_LAN2=2/' "$KC"
+    sed -i 's/CONFIG_RAETH_ESW_PORT_LAN3=.*/CONFIG_RAETH_ESW_PORT_LAN3=3/' "$KC"
+    sed -i 's/CONFIG_RAETH_ESW_PORT_LAN4=.*/CONFIG_RAETH_ESW_PORT_LAN4=4/' "$KC"
+    echo ">>> kernel-3.4.x.config — карта портов обновлена (WAN=0, LAN=1,2)"
 fi
 
 echo ">>> prebuild.sh finished OK"
