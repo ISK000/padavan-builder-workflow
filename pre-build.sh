@@ -43,85 +43,75 @@ find padavan-ng/trunk -name '*.dict' -print0 | while IFS= read -r -d '' F; do
   sed -i "s/ZVCOPYRVZ/${CUSTOM_FOOTER//\//\\/}/g" "$F"
 done
 
-# ======================================================================
-#  WAN = eth2 + корректная карта портов и правка детекта линка
-# ======================================================================
+# ===================== WAN = eth2, LAN = eth3+Wi-Fi ===================
 
-# 0) IFNAME_WAN на уровне платформы
+# 1) IFNAME_WAN на уровне платформы
 RBH="padavan-ng/trunk/user/shared/ralink_boards.h"
 if [ -f "$RBH" ]; then
-  # аккуратно заменим только если там не eth2
-  if ! grep -q '^[[:space:]]*#define[[:space:]]\+IFNAME_WAN[[:space:]]*"eth2"' "$RBH"; then
-    sed -i 's/^\([[:space:]]*#define[[:space:]]\+IFNAME_WAN[[:space:]]*\).*/\1"eth2"/' "$RBH"
-  fi
+  sed -i 's/^\([[:space:]]*#define[[:space:]]\+IFNAME_WAN[[:space:]]*\).*/\1"eth2"/' "$RBH"
   echo ">>> ralink_boards.h — IFNAME_WAN=\"eth2\""
 fi
 
-# 1) defaults.c: WAN=eth2, DHCP, LAN-мост без eth2
+# 2) defaults.c: WAN=eth2 (DHCP), LAN-мост без eth2
 DEF="padavan-ng/trunk/user/shared/defaults.c"
 if [ -f "$DEF" ]; then
   sed -i 's/{ *"wan_ifname", *IFNAME_WAN *}/{ "wan_ifname", "eth2" }/' "$DEF"
   sed -i 's/{ *"wan0_ifname", *IFNAME_WAN *}/{ "wan0_ifname", "eth2" }/' "$DEF"
   sed -i 's/{ *"wan_proto", *"dhcp" *}/{ "wan_proto", "dhcp" }/' "$DEF"
   sed -i 's/{ *"wan0_proto", *"dhcp" *}/{ "wan0_proto", "dhcp" }/' "$DEF"
-  # важно: в мост кладём eth3 (LAN), а не eth2
   sed -i 's/{ *"lan_ifnames", *".*" *}/{ "lan_ifnames", "eth3 ra0 rai0" }/' "$DEF"
   echo ">>> defaults.c — WAN=eth2, lan_ifnames=eth3 ra0 rai0"
 fi
 
-# 2) board.h: корректное число PHY (для R3Gv2 должно быть 3)
-BH="padavan-ng/trunk/configs/boards/XIAOMI/MI-R3Gv2/board.h"
-if [ -f "$BH" ]; then
-  sed -i 's/^#define[[:space:]]\+BOARD_NUM_ETH_EPHY[[:space:]].*/#define BOARD_NUM_ETH_EPHY\t3/' "$BH"
-  echo ">>> board.h — BOARD_NUM_ETH_EPHY=3 (1 WAN + 2 LAN)"
-fi
+# 3) добавим сервис wan-linkd и автозапуск через ваш Makefile+autostart.sh
+ROOTS="padavan-ng"   # тут лежат autostart.sh и Makefile в этом форке
+AS="$ROOTS/autostart.sh"
+MF="$ROOTS/Makefile"
+WD="$ROOTS/wan-linkd.sh"
 
-# 3) kernel 3.4 карта портов (WAN=0, LAN=1..)
-KC="padavan-ng/trunk/configs/boards/XIAOMI/MI-R3Gv2/kernel-3.4.x.config"
-if [ -f "$KC" ]; then
-  sed -i 's/^CONFIG_RAETH_ESW_PORT_WAN=.*/CONFIG_RAETH_ESW_PORT_WAN=0/'   "$KC"
-  sed -i 's/^CONFIG_RAETH_ESW_PORT_LAN1=.*/CONFIG_RAETH_ESW_PORT_LAN1=1/' "$KC"
-  sed -i 's/^CONFIG_RAETH_ESW_PORT_LAN2=.*/CONFIG_RAETH_ESW_PORT_LAN2=2/' "$KC"
-  sed -i 's/^CONFIG_RAETH_ESW_PORT_LAN3=.*/CONFIG_RAETH_ESW_PORT_LAN3=3/' "$KC"
-  sed -i 's/^CONFIG_RAETH_ESW_PORT_LAN4=.*/CONFIG_RAETH_ESW_PORT_LAN4=4/' "$KC"
-  echo ">>> kernel-3.4.x.config — карта портов обновлена (WAN=0, LAN=1,2)"
-fi
+# 3.1 сам скрипт: bringup + синхронизация ether_link_wan по carrier
+cat > "$WD" <<'EOF'
+#!/bin/sh
+WANIF="$(nvram get wan_ifname 2>/dev/null)"; [ -z "$WANIF" ] && WANIF=eth2
 
-# 4) Чиним детект “Ethernet Link State” для WebUI
-ETHSH="padavan-ng/trunk/user/scripts/ethernet.sh"
-if [ -f "$ETHSH" ]; then
-  # Вставим (или обновим) блок, который берёт статус прямо из sysfs по реальному wan_ifname
-  if ! grep -q '### WAN LINK FIX ###' "$ETHSH"; then
-    cat >>"$ETHSH" <<'EOF'
+# выкинуть WAN из моста, поднять интерфейс и DHCP-клиент
+brctl delif br0 "$WANIF" 2>/dev/null
+ifconfig "$WANIF" up
+killall udhcpc 2>/dev/null
+udhcpc -i "$WANIF" -b -t 5 -T 3 -s /usr/share/udhcpc/default.script
 
-# --- ### WAN LINK FIX ### ---
-# На некоторых платах (MT7621/MT7530) штатный код неверно мапит WAN порт.
-# Берём линк из /sys/class/net/${WANIF}/carrier и синхронизируем с NVRAM.
-wan_link_fix() {
-  WANIF="$(nvram get wan_ifname 2>/dev/null)"
-  [ -z "$WANIF" ] && WANIF="eth2"
-  if [ -r "/sys/class/net/${WANIF}/carrier" ]; then
-    C="$(cat /sys/class/net/${WANIF}/carrier 2>/dev/null)"
+# маленький вотчер линка для UI
+(
+  while sleep 2; do
+    C=0; [ -r "/sys/class/net/$WANIF/carrier" ] && C="$(cat /sys/class/net/$WANIF/carrier)"
     if [ "x$C" = "x1" ]; then
-      nvram set ether_link_wan=1
-      nvram set ether_flow_wan=1
+      nvram set ether_link_wan=1; nvram set ether_flow_wan=1
     else
-      nvram set ether_link_wan=0
-      nvram set ether_flow_wan=0
+      nvram set ether_link_wan=0; nvram set ether_flow_wan=0
     fi
     nvram commit
-  fi
-}
-
-# вызываем фикс в конце обновления линков (функция может называться по-разному;
-# безопасно дергаем здесь, т.к. скрипт исполняется периодически)
-wan_link_fix
-# --- ### /WAN LINK FIX ### ---
+  done
+) &
+exit 0
 EOF
-    echo ">>> ethernet.sh — добавлен WAN LINK FIX (sysfs carrier → ether_link_wan)"
-  else
-    echo ">>> ethernet.sh — WAN LINK FIX уже присутствует"
-  fi
+chmod +x "$WD"
+echo ">>> создали wan-linkd.sh"
+
+# 3.2 установим его в образ (/usr/bin/wan-linkd)
+if grep -q 'wan-linkd' "$MF"; then
+  echo ">>> Makefile уже устанавливает wan-linkd"
+else
+  # добавим одну строку ROMFSINST
+  sed -i 's#^\(\s*$(ROMFSINST) /sbin/mtd_storage.sh.*\)$#\1\n\t$(ROMFSINST) -p +x '"$WD"' /usr/bin/wan-linkd#' "$MF"
+  echo ">>> Makefile — добавлена установка /usr/bin/wan-linkd"
+fi
+
+# 3.3 автозапуск в конце autostart.sh (один раз)
+if ! grep -q 'wan-linkd' "$AS"; then
+  printf '\n# start WAN link daemon\n/usr/bin/wan-linkd &\n' >> "$AS"
+  echo ">>> autostart.sh — добавлен запуск wan-linkd"
+else
+  echo ">>> autostart.sh — запуск wan-linkd уже есть"
 fi
 
 echo ">>> prebuild.sh finished OK"
