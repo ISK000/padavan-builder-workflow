@@ -120,4 +120,3 @@ grep -q 'custom-extras' "$U_MF" || echo 'DIRS-y += custom-extras' >> "$U_MF"
 
 echo '>>> custom-extras ready (client.sh, awg-client, obfs4-run, wg0.conf.example)'
 
-echo ">>> GUI shims added: AmneziaWG/WG + obfs4proxy"
