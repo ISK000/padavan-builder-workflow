@@ -169,6 +169,7 @@ romfs:
 	@echo "[custom-extras] installing..."
 	$(ROMFSINST) -p +x files/usr/bin/awg-client /usr/bin/awg-client
 	$(ROMFSINST) -p +x files/usr/bin/obfs4-run /usr/bin/obfs4-run
+	mkdir -p $(ROOTDIR)/romfs/etc/storage/wireguard
 	$(ROMFSINST) files/etc/storage/wireguard/wg0.conf.example /etc/storage/wireguard/wg0.conf.example
 	@echo "[custom-extras] DONE"
 clean:
