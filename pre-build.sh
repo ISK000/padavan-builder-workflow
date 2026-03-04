@@ -1,14 +1,15 @@
 #!/bin/bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v4.0
+# MILLENIUM Group — Padavan-NG pre-build v4.1
 #
-# udp2raw FakeTCP tunnel ONLY.
-# OpenVPN настраивается через стандартный VPN клиент Padavan.
-# Эта страница управляет только udp2raw туннелем:
+# = OpenVPN 2.6.14 + XOR patch (scramble obfuscate)
+# = udp2raw FakeTCP tunnel
 #   - Список серверов (домены + IP)
 #   - Порт, пароль udp2raw
 #   - Авто-failover между серверами
 #   - Watchdog (cron)
+# = WebUI страница управления udp2raw
+# = custom-extras (AmneziaWG, obfs4)
 ############################################################
 set -euo pipefail
 
@@ -17,12 +18,51 @@ UDP2RAW_DIR="$TRUNK/user/udp2raw-tunnel"
 WWW="$TRUNK/user/www/n56u_ribbon_fixed"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v4.0"
-echo "  udp2raw tunnel only, OpenVPN = Padavan"
+echo "  MILLENIUM Group VPN — pre-build v4.1"
+echo "  OpenVPN XOR + udp2raw tunnel + WebUI"
 echo "============================================"
 
 ############################################################
-# 1. udp2raw binary
+# 1. OpenVPN + XOR patch (scramble obfuscate)
+############################################################
+echo ">>> OpenVPN XOR patch"
+OVPN_VER=2.6.14
+RELEASE_URL="https://github.com/luzrain/openvpn-xorpatch/releases/download/v${OVPN_VER}/openvpn-${OVPN_VER}.tar.gz"
+
+OPENVPN_DIRS=(
+  "padavan-ng/trunk/user/openvpn"
+  "padavan-ng/trunk/user/openvpn-openssl"
+)
+
+for dir in "${OPENVPN_DIRS[@]}"; do
+  mf="${dir}/Makefile"
+  [[ -f $mf ]] || continue
+  echo "  >>> refresh ${dir}"
+  rm -rf "${dir}/openvpn-${OVPN_VER}" "${dir}/openvpn-${OVPN_VER}.tar."* 2>/dev/null || true
+  curl -L --retry 5 -o "${dir}/openvpn-${OVPN_VER}.tar.gz" "${RELEASE_URL}"
+  sed -i "s|^SRC_NAME=.*|SRC_NAME=openvpn-${OVPN_VER}|" "${mf}"
+  sed -i "s|^SRC_URL=.*|SRC_URL=${RELEASE_URL}|" "${mf}"
+  grep -q -- '--enable-xor-patch' "${mf}" || \
+    sed -i 's/--enable-small/--enable-small \\\n\t--enable-xor-patch/' "${mf}"
+  sed -i 's|true # autoreconf disabled.*|autoreconf -fi |' "${mf}"
+  sed -i '/openvpn-orig\.patch/s|^[^\t#]|#&|' "${mf}"
+  echo "  XOR patch applied: ${dir}"
+done
+
+############################################################
+# 2. WebUI branding
+############################################################
+echo ">>> WebUI branding"
+CUSTOM_MODEL="MILLENIUM Group VPN (private build)"
+CUSTOM_FOOTER="(c) 2025 MILLENIUM Group.  Powered by Padavan-NG"
+sed -i 's/^Web_Title=.*/Web_Title=ZVMODELVZ Wireless Router/;' padavan-ng/trunk/romfs/www/*.dict 2>/dev/null || true
+find padavan-ng/trunk -name '*.dict' -print0 | while IFS= read -r -d '' F; do
+  sed -i "s/ZVMODELVZ/${CUSTOM_MODEL//\//\\/}/g" "$F"
+  sed -i "s/ZVCOPYRVZ/${CUSTOM_FOOTER//\//\\/}/g" "$F"
+done
+
+############################################################
+# 3. udp2raw binary
 ############################################################
 echo ">>> Downloading udp2raw binary"
 mkdir -p "$UDP2RAW_DIR/files"
@@ -35,7 +75,7 @@ cd "$OLDPWD"
 echo "  $(ls -la $UDP2RAW_DIR/files/udp2raw)"
 
 ############################################################
-# 2. udp2raw-ctl — start/stop udp2raw process
+# 4. udp2raw-ctl — start/stop udp2raw process
 ############################################################
 cat > "$UDP2RAW_DIR/files/udp2raw-ctl" << 'CTLEOF'
 #!/bin/sh
@@ -81,7 +121,7 @@ CTLEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-ctl"
 
 ############################################################
-# 3. fl-vpn-start — iterate servers, resolve DNS, start tunnel
+# 5. fl-vpn-start — iterate servers, resolve DNS, start tunnel
 ############################################################
 cat > "$UDP2RAW_DIR/files/fl-vpn-start" << 'VPNEOF'
 #!/bin/sh
@@ -179,7 +219,7 @@ VPNEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-start"
 
 ############################################################
-# 4. fl-vpn-stop — stop tunnel, clean route
+# 6. fl-vpn-stop — stop tunnel, clean route
 ############################################################
 cat > "$UDP2RAW_DIR/files/fl-vpn-stop" << 'STOPEOF'
 #!/bin/sh
@@ -191,7 +231,7 @@ STOPEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-stop"
 
 ############################################################
-# 5. fl-vpn-switch — try next server
+# 7. fl-vpn-switch — try next server
 ############################################################
 cat > "$UDP2RAW_DIR/files/fl-vpn-switch" << 'SWEOF'
 #!/bin/sh
@@ -202,7 +242,7 @@ SWEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-switch"
 
 ############################################################
-# 6. fl-vpn-watchdog — cron, check udp2raw alive
+# 8. fl-vpn-watchdog — cron, check udp2raw alive
 ############################################################
 cat > "$UDP2RAW_DIR/files/fl-vpn-watchdog" << 'WDEOF'
 #!/bin/sh
@@ -234,7 +274,6 @@ if ! pidof udp2raw >/dev/null 2>&1; then
 fi
 
 # Optional: check if tunnel actually works by pinging through VPN
-# (only if OpenVPN is also connected — tun interface exists)
 TUN=""
 for t in tun0 tun1 tun2; do
     ip link show "$t" 2>/dev/null | grep -q UP && { TUN="$t"; break; }
@@ -251,7 +290,7 @@ WDEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-watchdog"
 
 ############################################################
-# 7. fl-vpn-status
+# 9. fl-vpn-status
 ############################################################
 cat > "$UDP2RAW_DIR/files/fl-vpn-status" << 'STEOF'
 #!/bin/sh
@@ -267,7 +306,7 @@ chmod +x "$UDP2RAW_DIR/files/fl-vpn-status"
 echo ">>> Scripts ready"
 
 ############################################################
-# 8. custom-extras fix
+# 10. custom-extras fix
 ############################################################
 echo ">>> custom-extras"
 CUSTOM_DIR="$TRUNK/user/custom-extras"
@@ -278,7 +317,7 @@ if [ -d "$CUSTOM_DIR" ]; then
 fi
 
 ############################################################
-# 9. Patch user/Makefile
+# 11. Patch user/Makefile
 ############################################################
 echo ">>> Patching user/Makefile..."
 UMAKEFILE="$TRUNK/user/Makefile"
@@ -292,7 +331,7 @@ fi
 grep "udp2raw-tunnel" "$UMAKEFILE" | head -3
 
 ############################################################
-# 10. Makefile for udp2raw-tunnel
+# 12. Makefile for udp2raw-tunnel
 ############################################################
 cat > "$UDP2RAW_DIR/Makefile" << 'MKEOF'
 all:
@@ -315,7 +354,7 @@ clean:
 MKEOF
 
 ############################################################
-# 11. Status AJAX endpoint
+# 13. Status AJAX endpoint
 ############################################################
 echo ">>> WebUI setup..."
 echo "  www: $WWW"
@@ -325,7 +364,7 @@ cat > "$WWW/millenium_status.asp" << 'STATUSEOF'
 STATUSEOF
 
 ############################################################
-# 12. ASP page — udp2raw tunnel settings only
+# 14. ASP page — udp2raw tunnel settings + multi-server
 ############################################################
 rm -f "$WWW/Advanced_udp2raw.asp"
 
@@ -410,13 +449,13 @@ function update_status(){
     var info = document.getElementById('vpn_info');
     if(!el) return;
     if(s == 'CONNECTED'){
-        el.innerHTML = '<span class="label label-success" style="font-size:14px;padding:5px 12px;">\u25CF \u0422\u0443\u043d\u043d\u0435\u043b\u044c \u0430\u043a\u0442\u0438\u0432\u0435\u043d</span>';
-        info.innerHTML = m_active ? '\u0421\u0435\u0440\u0432\u0435\u0440: <b>'+m_active+'</b>' : '';
+        el.innerHTML = '<span class="label label-success" style="font-size:14px;padding:5px 12px;">&#x25CF; Туннель активен</span>';
+        info.innerHTML = m_active ? 'Сервер: <b>'+m_active+'</b>' : '';
     } else if(s == 'CONNECTING...'){
-        el.innerHTML = '<span class="label label-warning" style="font-size:14px;padding:5px 12px;">\u25CF \u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435...</span>';
-        info.innerHTML = '<i>\u041f\u0435\u0440\u0435\u0431\u043e\u0440 \u0441\u0435\u0440\u0432\u0435\u0440\u043e\u0432...</i>';
+        el.innerHTML = '<span class="label label-warning" style="font-size:14px;padding:5px 12px;">&#x25CF; Подключение...</span>';
+        info.innerHTML = '<i>Перебор серверов...</i>';
     } else {
-        el.innerHTML = '<span class="label label-important" style="font-size:14px;padding:5px 12px;">\u25cb \u0422\u0443\u043d\u043d\u0435\u043b\u044c \u0432\u044b\u043a\u043b.</span>';
+        el.innerHTML = '<span class="label label-important" style="font-size:14px;padding:5px 12px;">&#x25cb; Туннель выкл.</span>';
         info.innerHTML = (s != 'DISCONNECTED' && s) ? '<span style="color:#c00">'+s+'</span>' : '';
     }
 }
@@ -495,10 +534,11 @@ function done_validating(action){}
                     <div class="round_bottom">
 
                         <div class="alert alert-info" style="margin:10px;">
-                            udp2raw &#x442;&#x443;&#x43d;&#x43d;&#x435;&#x43b;&#x44c; &mdash; &#x43e;&#x431;&#x43e;&#x440;&#x430;&#x447;&#x438;&#x432;&#x430;&#x435;&#x442; UDP &#x432; FakeTCP &#x434;&#x43b;&#x44f; &#x43e;&#x431;&#x445;&#x43e;&#x434;&#x430; DPI.
-                            <br>OpenVPN &#x43d;&#x430;&#x441;&#x442;&#x440;&#x430;&#x438;&#x432;&#x430;&#x435;&#x442;&#x441;&#x44f; &#x432;
-                            <a href="/vpncli.asp"><b>VPN &#x43a;&#x43b;&#x438;&#x435;&#x43d;&#x442;</b></a>
+                            udp2raw туннель &mdash; оборачивает UDP в FakeTCP для обхода DPI.
+                            <br>OpenVPN настраивается в
+                            <a href="/vpncli.asp"><b>VPN клиент</b></a>
                             (remote 127.0.0.1:3333).
+                            <br>OpenVPN использует <b>scramble obfuscate</b> — XOR шифрование заголовков.
                         </div>
 
                         <!-- STATUS -->
@@ -510,7 +550,7 @@ function done_validating(action){}
                         <!-- ENABLE -->
                         <table class="table">
                             <tr>
-                                <th width="50%" style="border-top:0 none;">&#x412;&#x43a;&#x43b;&#x44e;&#x447;&#x438;&#x442;&#x44c; udp2raw &#x442;&#x443;&#x43d;&#x43d;&#x435;&#x43b;&#x44c;</th>
+                                <th width="50%" style="border-top:0 none;">Включить udp2raw туннель</th>
                                 <td style="border-top:0 none;">
                                     <div class="main_itoggle">
                                         <div id="udp2raw_enable_on_of">
@@ -521,9 +561,9 @@ function done_validating(action){}
                                     </div>
                                     <div style="position:absolute; margin-left:-10000px;">
                                         <input type="radio" name="udp2raw_enable" id="udp2raw_enable_1" class="input" value="1" onclick="change_enabled();"
-                                            <% nvram_match_x("", "udp2raw_enable", "1", "checked"); %>>&#x414;&#x430;
+                                            <% nvram_match_x("", "udp2raw_enable", "1", "checked"); %>>Да
                                         <input type="radio" name="udp2raw_enable" id="udp2raw_enable_0" class="input" value="0" onclick="change_enabled();"
-                                            <% nvram_match_x("", "udp2raw_enable", "0", "checked"); %>>&#x41d;&#x435;&#x442;
+                                            <% nvram_match_x("", "udp2raw_enable", "0", "checked"); %>>Нет
                                     </div>
                                 </td>
                             </tr>
@@ -532,17 +572,16 @@ function done_validating(action){}
                         <!-- CONFIG -->
                         <div id="cfg_main" style="display:none;">
                         <table class="table">
-                            <tr><th colspan="2" style="background:#E3E3E3;">&#x421;&#x435;&#x440;&#x432;&#x435;&#x440;&#x44b; udp2raw</th></tr>
+                            <tr><th colspan="2" style="background:#E3E3E3;">Серверы udp2raw</th></tr>
                             <tr>
                                 <td colspan="2">
                                     <textarea id="srv_text" rows="6" wrap="off" spellcheck="false"
                                         class="span12" style="font-family:'Courier New'; font-size:12px;"
-                                        placeholder="first.zapalashnikov.ru:4096:password&#10;sakura.domain.space:4096:password&#10;89.39.70.224:4096:password"></textarea>
+                                        placeholder="first.zapalashnikov.ru:4096:millenium2026&#10;sakura.domain.space:4096:millenium2026&#10;89.39.70.30:4096:millenium2026"></textarea>
                                     <div class="help-text">
-                                        &#x424;&#x43e;&#x440;&#x43c;&#x430;&#x442;: &#x425;&#x41e;&#x421;&#x422;:&#x41f;&#x41e;&#x420;&#x422;:&#x41f;&#x410;&#x420;&#x41e;&#x41b;&#x42c; &mdash;
-                                        &#x434;&#x43e;&#x43c;&#x435;&#x43d;&#x44b; &#x438;&#x43b;&#x438; IP, &#x43e;&#x434;&#x438;&#x43d; &#x43d;&#x430; &#x441;&#x442;&#x440;&#x43e;&#x43a;&#x443;.
-                                        &#x41f;&#x430;&#x440;&#x43e;&#x43b;&#x44c; &mdash; &#x44d;&#x442;&#x43e; &#x43f;&#x430;&#x440;&#x43e;&#x43b;&#x44c; udp2raw (-k), &#x43d;&#x435; OpenVPN!
-                                        <br>&#x41f;&#x440;&#x438; &#x43e;&#x442;&#x43a;&#x430;&#x437;&#x435; &mdash; &#x430;&#x432;&#x442;&#x43e;&#x43c;&#x430;&#x442;&#x438;&#x447;&#x435;&#x441;&#x43a;&#x438; &#x43f;&#x435;&#x440;&#x435;&#x43a;&#x43b;&#x44e;&#x447;&#x430;&#x435;&#x442;&#x441;&#x44f; &#x43d;&#x430; &#x441;&#x43b;&#x435;&#x434;&#x443;&#x44e;&#x449;&#x438;&#x439;.
+                                        Формат: ХОСТ:ПОРТ:ПАРОЛЬ &mdash; домены или IP, один на строку.
+                                        Пароль &mdash; это пароль udp2raw (-k), не OpenVPN!
+                                        <br>При отказе &mdash; автоматически переключается на следующий.
                                     </div>
                                 </td>
                             </tr>
@@ -555,11 +594,11 @@ function done_validating(action){}
                                 <td style="border:0 none;">
                                     <center>
                                         <input type="button" class="btn btn-primary" style="width:219px"
-                                            onclick="applyRule();" value="&#x421;&#x43e;&#x445;&#x440;&#x430;&#x43d;&#x438;&#x442;&#x44c;">
+                                            onclick="applyRule();" value="Сохранить">
                                     </center>
                                     <div class="help-text" style="text-align:center; margin-top:8px;">
-                                        &#x422;&#x443;&#x43d;&#x43d;&#x435;&#x43b;&#x44c; &#x43f;&#x43e;&#x0434;&#x043a;&#x043b;&#x044e;&#x0447;&#x0438;&#x0442;&#x0441;&#x044f; &#x0430;&#x0432;&#x0442;&#x043e;&#x043c;&#x0430;&#x0442;&#x0438;&#x0447;&#x0435;&#x0441;&#x043a;&#x0438; &#x0432; &#x0442;&#x0435;&#x0447;&#x0435;&#x043d;&#x0438;&#x0435; 1 &#x043c;&#x0438;&#x043d;.
-                                        &#x0421;&#x0442;&#x0430;&#x0442;&#x0443;&#x0441; &#x043e;&#x0431;&#x043d;&#x043e;&#x0432;&#x043b;&#x044f;&#x0435;&#x0442;&#x0441;&#x044f; &#x043a;&#x0430;&#x0436;&#x0434;&#x044b;&#x0435; 5 &#x0441;&#x0435;&#x043a;.
+                                        Туннель подключится автоматически в течение 1 мин.
+                                        Статус обновляется каждые 5 сек.
                                     </div>
                                 </td>
                             </tr>
@@ -576,10 +615,10 @@ function done_validating(action){}
 </body>
 </html>
 ASPEOF
-echo "  Created Advanced_udp2raw.asp v4"
+echo "  Created Advanced_udp2raw.asp v4.1"
 
 ############################################################
-# 13. Patch state.js
+# 15. Patch state.js
 ############################################################
 echo ">>> Patching state.js..."
 STATEJS="$WWW/state.js"
@@ -591,7 +630,7 @@ menuL2_title.push(\"MILLENIUM VPN\");\\
 menuL2_link.push(\"Advanced_udp2raw.asp\");" "$STATEJS"
         echo "  OK: push() after line $ML2_LINE"
     else
-        echo "  WARN: menuL2_link not found, ASP fallback"
+        echo "  WARN: menuL2_link not found"
     fi
     grep -n "MILLENIUM\|udp2raw" "$STATEJS" | head -3
 else
@@ -599,7 +638,7 @@ else
 fi
 
 ############################################################
-# 14. nvram defaults
+# 16. nvram defaults
 ############################################################
 echo ">>> nvram defaults..."
 FOUND_DEFAULTS=""
@@ -634,7 +673,8 @@ fi
 
 ############################################################
 echo "============================================"
-echo "  MILLENIUM Group VPN — build ready v4.0"
+echo "  MILLENIUM Group VPN — build ready v4.1"
+echo "  - OpenVPN 2.6.14 + XOR patch (scramble)"
 echo "  - udp2raw 20230206.0 (mipsel) FakeTCP"
 echo "  - WebUI: серверы (домены+IP), авто-статус"
 echo "  - Failover + watchdog (cron)"
