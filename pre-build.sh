@@ -583,143 +583,69 @@ echo "  Created Advanced_udp2raw.asp v3 (proper Padavan template)"
 ############################################################
 echo ">>> Patching state.js menu..."
 STATEJS="$WWW/state.js"
-POPUPJS="$WWW/popup.js"
 
 if [ -f "$STATEJS" ] && ! grep -q "Advanced_udp2raw" "$STATEJS"; then
-    # === DIAGNOSTIC: dump menu structure ===
-    echo "  --- state.js: lines with .asp in arrays ---"
-    grep -n 'Advanced_Wireless_Content\|Advanced_LAN\|menuL2_title\|menuL2_link' "$STATEJS" | head -15
-    echo "  --- state.js: lines with 'new Array.*\.asp' ---"
-    grep -n 'new Array.*\.asp' "$STATEJS" | head -10
-    echo "  --- state.js: lines 410-430 ---"
-    sed -n '410,430p' "$STATEJS"
-    echo "  --- state.js: lines with menuL2 ---"
-    grep -n 'menuL2' "$STATEJS" | head -20
-    echo "  ==="
+    # Find the line where menuL2_link is defined
+    ML2_LINE=$(grep -n 'menuL2_link.*new Array' "$STATEJS" | head -1 | cut -d: -f1)
 
-    INSERTED=0
-
-    # METHOD 1: Static menuL2_link array (padavan-ng style)
-    # Look for: menuL2_link = new Array("", "Advanced_Wireless_Content.asp", ...);
-    if grep -q 'menuL2_link.*new Array' "$STATEJS"; then
-        echo "  Found menuL2_link static array"
-        # Add our page to the end of the array
-        sed -i 's|\(menuL2_link = new Array([^)]*\))|\1.concat(["Advanced_udp2raw.asp"])|' "$STATEJS"
-        sed -i 's|\(menuL2_title = new Array([^)]*\))|\1.concat(["MILLENIUM VPN"])|' "$STATEJS"
-        INSERTED=1
-        echo "  OK: appended to static menuL2 arrays via concat"
-
-    # METHOD 2: Dynamic menuL2_num++ style (classic padavan)
-    elif grep -q 'menuL2_num' "$STATEJS"; then
-        echo "  Found menuL2_num dynamic style"
-        LAST=$(grep -n 'menuL2_num' "$STATEJS" | tail -1 | cut -d: -f1)
-        sed -i "${LAST}a\\
-    menuL2_title[menuL2_num] = \"MILLENIUM VPN\";\\
-    menuL2_link[menuL2_num] = \"Advanced_udp2raw.asp\";\\
-    menuL2_num++;" "$STATEJS"
-        INSERTED=1
-        echo "  OK: added via menuL2_num++ (line $LAST)"
-
-    # METHOD 3: Look for menuL2_link as plain array assignment
-    elif grep -q 'menuL2_link\[' "$STATEJS"; then
-        echo "  Found menuL2_link[N] indexed style"
-        LAST_IDX=$(grep -o 'menuL2_link\[[0-9]*\]' "$STATEJS" | tail -1 | grep -o '[0-9]*')
-        LAST_LINE=$(grep -n "menuL2_link\[$LAST_IDX\]" "$STATEJS" | tail -1 | cut -d: -f1)
-        NEXT_IDX=$((LAST_IDX + 1))
-        sed -i "${LAST_LINE}a\\
-menuL2_title[$NEXT_IDX] = \"MILLENIUM VPN\";\\
-menuL2_link[$NEXT_IDX] = \"Advanced_udp2raw.asp\";" "$STATEJS"
-        INSERTED=1
-        echo "  OK: added as menuL2[${NEXT_IDX}] after line $LAST_LINE"
-    fi
-
-    # METHOD 4: Fallback - patch popup.js to inject menu entry
-    if [ "$INSERTED" = "0" ] && [ -f "$POPUPJS" ]; then
-        echo "  No standard menuL2 found. Trying popup.js..."
-        echo "  --- popup.js: menu generation patterns ---"
-        grep -n 'subMenu\|menuL2\|sidebar\|mainMenu\|Advanced_' "$POPUPJS" | head -15
-        echo "  ==="
-
-        # Try appending menu entry via JavaScript injection at end of build_menu function
-        if grep -q 'Advanced_Personalization' "$POPUPJS"; then
-            LINE=$(grep -n 'Advanced_Personalization' "$POPUPJS" | tail -1 | cut -d: -f1)
-            sed -i "${LINE}a\\
-// MILLENIUM VPN menu entry\\
-if(typeof(menuL2_title)!='undefined'){menuL2_title.push('MILLENIUM VPN');menuL2_link.push('Advanced_udp2raw.asp');}" "$POPUPJS"
-            INSERTED=1
-            echo "  OK: injected into popup.js after Personalization (line $LINE)"
-        fi
-    fi
-
-    # METHOD 5: Ultimate fallback - inject via our ASP page itself
-    if [ "$INSERTED" = "0" ]; then
-        echo "  WARNING: Could not add menu item via state.js or popup.js"
-        echo "  Page accessible at: /Advanced_udp2raw.asp"
-        echo "  Will add self-injection in ASP page"
+    if [ -n "$ML2_LINE" ]; then
+        # Simple and reliable: add push() calls right after the array definitions
+        sed -i "${ML2_LINE}a\\
+menuL2_title.push(\"MILLENIUM VPN\");\\
+menuL2_link.push(\"Advanced_udp2raw.asp\");" "$STATEJS"
+        echo "  OK: added push() after menuL2 arrays (line $ML2_LINE)"
+    else
+        echo "  WARN: menuL2_link array not found in state.js"
+        echo "  Menu will be injected via ASP page JavaScript fallback"
     fi
 
     # Verify
-    grep -n "udp2raw\|MILLENIUM" "$STATEJS" "$POPUPJS" 2>/dev/null | head -5
+    grep -n "MILLENIUM\|udp2raw" "$STATEJS" | head -3
 else
     [ -f "$STATEJS" ] && echo "  ALREADY PATCHED" || echo "  WARN: state.js not found"
 fi
 
-############################################################
-# 13. nvram defaults
+# 13. nvram defaults (runtime init)
 ############################################################
 echo ">>> nvram defaults..."
-DEFAULTS_H="$TRUNK/user/shared/defaults.h"
-
-if [ -f "$DEFAULTS_H" ] && ! grep -q "udp2raw_enable" "$DEFAULTS_H"; then
-    # Diagnostic: show file structure
-    echo "  --- defaults.h: last 10 lines ---"
-    tail -10 "$DEFAULTS_H"
-    echo "  --- defaults.h: terminator patterns ---"
-    grep -n '0.*0\|NULL\|{.*}' "$DEFAULTS_H" | tail -5
-    echo "  --- defaults.h: last 3 entries ---"
-    grep -n '".*".*".*"' "$DEFAULTS_H" | tail -3
-    echo "  ==="
-
-    INSERTED=0
-
-    # Method 1: { 0, 0 }  
-    if grep -q '{ 0, 0 }' "$DEFAULTS_H"; then
-        sed -i '/{ 0, 0 }/i\\t{ "udp2raw_enable", "0" },\n\t{ "udp2raw_servers", "" },\n\t{ "udp2raw_status", "" },\n\t{ "udp2raw_active", "" },\n\t{ "udp2raw_vpnip", "" },' "$DEFAULTS_H"
-        INSERTED=1; echo "  defaults.h: inserted before { 0, 0 }"
-
-    # Method 2: {0, 0}
-    elif grep -q '{0, 0}' "$DEFAULTS_H"; then
-        sed -i '/{0, 0}/i\\t{ "udp2raw_enable", "0" },\n\t{ "udp2raw_servers", "" },\n\t{ "udp2raw_status", "" },\n\t{ "udp2raw_active", "" },\n\t{ "udp2raw_vpnip", "" },' "$DEFAULTS_H"
-        INSERTED=1; echo "  defaults.h: inserted before {0, 0}"
-
-    # Method 3: { NULL, NULL }
-    elif grep -q 'NULL.*NULL' "$DEFAULTS_H"; then
-        TERM_LINE=$(grep -n 'NULL.*NULL' "$DEFAULTS_H" | tail -1 | cut -d: -f1)
-        sed -i "${TERM_LINE}i\\\\t{ \"udp2raw_enable\", \"0\" },\\n\\t{ \"udp2raw_servers\", \"\" },\\n\\t{ \"udp2raw_status\", \"\" },\\n\\t{ \"udp2raw_active\", \"\" },\\n\\t{ \"udp2raw_vpnip\", \"\" }," "$DEFAULTS_H"
-        INSERTED=1; echo "  defaults.h: inserted before NULL,NULL (line $TERM_LINE)"
-
-    # Method 4: Find last line with {"...", "..."} and insert after
-    else
-        LAST_ENTRY=$(grep -n '"[^"]*".*"[^"]*"' "$DEFAULTS_H" | tail -1 | cut -d: -f1)
-        if [ -n "$LAST_ENTRY" ]; then
-            sed -i "${LAST_ENTRY}a\\\\t{ \"udp2raw_enable\", \"0\" },\\n\\t{ \"udp2raw_servers\", \"\" },\\n\\t{ \"udp2raw_status\", \"\" },\\n\\t{ \"udp2raw_active\", \"\" },\\n\\t{ \"udp2raw_vpnip\", \"\" }," "$DEFAULTS_H"
-            INSERTED=1; echo "  defaults.h: appended after last entry (line $LAST_ENTRY)"
-        fi
+# padavan-ng defaults.h only has #define macros, not the router_defaults[] array.
+# nvram variables are initialized at runtime by our scripts instead.
+# The ASP page reads nvram_get_x() which returns "" for undefined vars = safe defaults.
+# On first "Save", httpd writes all form fields to nvram.
+#
+# Search for the actual router_defaults[] array
+FOUND_DEFAULTS=""
+for F in "$TRUNK/user/shared/defaults.h" "$TRUNK/user/shared/defaults.c" \
+         "$TRUNK/user/rc/defaults.c" "$TRUNK/user/httpd/variables.c" \
+         "$TRUNK/user/shared/flash.c"; do
+    if [ -f "$F" ] && grep -q 'router_defaults\|nvram_pair' "$F"; then
+        echo "  Found router_defaults in: $F"
+        FOUND_DEFAULTS="$F"
+        break
     fi
+done
 
-    if [ "$INSERTED" = "0" ]; then
-        echo "  SKIP: cannot find insertion point in defaults.h"
-        echo "  nvram will be initialized at runtime via scripts"
+if [ -n "$FOUND_DEFAULTS" ] && ! grep -q "udp2raw_enable" "$FOUND_DEFAULTS"; then
+    # Try to insert before { 0, 0 } or { NULL, NULL } terminator
+    if grep -q '{ 0, 0 }' "$FOUND_DEFAULTS"; then
+        sed -i '/{ 0, 0 }/i\\t{ "udp2raw_enable", "0" },\n\t{ "udp2raw_servers", "" },\n\t{ "udp2raw_status", "" },\n\t{ "udp2raw_active", "" },\n\t{ "udp2raw_vpnip", "" },' "$FOUND_DEFAULTS"
+        echo "  Inserted nvram defaults before { 0, 0 }"
+    elif grep -q '{0, 0}' "$FOUND_DEFAULTS"; then
+        sed -i '/{0, 0}/i\\t{ "udp2raw_enable", "0" },\n\t{ "udp2raw_servers", "" },\n\t{ "udp2raw_status", "" },\n\t{ "udp2raw_active", "" },\n\t{ "udp2raw_vpnip", "" },' "$FOUND_DEFAULTS"
+        echo "  Inserted nvram defaults before {0, 0}"
+    elif grep -q 'NULL.*NULL' "$FOUND_DEFAULTS"; then
+        TERM=$(grep -n 'NULL.*NULL' "$FOUND_DEFAULTS" | tail -1 | cut -d: -f1)
+        sed -i "${TERM}i\\\\t{ \"udp2raw_enable\", \"0\" },\\n\\t{ \"udp2raw_servers\", \"\" },\\n\\t{ \"udp2raw_status\", \"\" },\\n\\t{ \"udp2raw_active\", \"\" },\\n\\t{ \"udp2raw_vpnip\", \"\" }," "$FOUND_DEFAULTS"
+        echo "  Inserted nvram defaults before NULL terminator"
     else
-        grep -n "udp2raw" "$DEFAULTS_H" | head -5
+        echo "  SKIP: no terminator found in $FOUND_DEFAULTS"
     fi
-elif [ -f "$DEFAULTS_H" ]; then
-    echo "  defaults.h: already has udp2raw entries"
+    grep -n "udp2raw" "$FOUND_DEFAULTS" 2>/dev/null | head -3
 else
-    echo "  SKIP: defaults.h not found"
+    echo "  SKIP: router_defaults[] not found or already patched"
+    echo "  nvram will init at runtime (ASP page handles empty values safely)"
 fi
 
-############################################################
 # 14. Branding
 ############################################################
 echo ">>> Branding..."
