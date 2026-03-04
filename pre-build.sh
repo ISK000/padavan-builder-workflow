@@ -1,12 +1,14 @@
 #!/bin/bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v3.1
+# MILLENIUM Group — Padavan-NG pre-build v4.0
 #
-# Простая схема:
-#   VPN клиент (Padavan) → OpenVPN remote 127.0.0.1 3333
-#   MILLENIUM VPN → udp2raw серверы (домены, failover)
-#
-# Мы управляем ТОЛЬКО udp2raw. OpenVPN — стандартный Padavan.
+# udp2raw FakeTCP tunnel ONLY.
+# OpenVPN настраивается через стандартный VPN клиент Padavan.
+# Эта страница управляет только udp2raw туннелем:
+#   - Список серверов (домены + IP)
+#   - Порт, пароль udp2raw
+#   - Авто-failover между серверами
+#   - Watchdog (cron)
 ############################################################
 set -euo pipefail
 
@@ -15,25 +17,25 @@ UDP2RAW_DIR="$TRUNK/user/udp2raw-tunnel"
 WWW="$TRUNK/user/www/n56u_ribbon_fixed"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v3.1"
+echo "  MILLENIUM Group VPN — pre-build v4.0"
+echo "  udp2raw tunnel only, OpenVPN = Padavan"
 echo "============================================"
 
 ############################################################
 # 1. udp2raw binary
 ############################################################
-echo ">>> Setting up udp2raw-tunnel"
+echo ">>> Downloading udp2raw binary"
 mkdir -p "$UDP2RAW_DIR/files"
-
 curl -sL -o /tmp/udp2raw_binaries.tar.gz \
   https://github.com/wangyu-/udp2raw/releases/download/20230206.0/udp2raw_binaries.tar.gz
-cd /tmp && tar xzf udp2raw_binaries.tar.gz && ls udp2raw_*
+cd /tmp && tar xzf udp2raw_binaries.tar.gz
 cp udp2raw_mips24kc_le "$OLDPWD/$UDP2RAW_DIR/files/udp2raw"
 chmod +x "$OLDPWD/$UDP2RAW_DIR/files/udp2raw"
 cd "$OLDPWD"
-echo ">>> Binary: $(ls -la $UDP2RAW_DIR/files/udp2raw)"
+echo "  $(ls -la $UDP2RAW_DIR/files/udp2raw)"
 
 ############################################################
-# 2. udp2raw-ctl (start/stop udp2raw binary)
+# 2. udp2raw-ctl — start/stop udp2raw process
 ############################################################
 cat > "$UDP2RAW_DIR/files/udp2raw-ctl" << 'CTLEOF'
 #!/bin/sh
@@ -41,30 +43,45 @@ PIDFILE="/var/run/udp2raw.pid"
 LOGFILE="/tmp/udp2raw.log"
 
 do_start() {
-    [ -f /tmp/udp2raw_srv ] && . /tmp/udp2raw_srv || { echo "No server"; return 1; }
+    [ -f /tmp/udp2raw_srv ] && . /tmp/udp2raw_srv || { echo "No server config"; return 1; }
     [ -z "$SRV" ] && return 1
     killall udp2raw 2>/dev/null; sleep 1
+
+    # RST suppression (required for faketcp mode)
     iptables -C OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null || \
         iptables -A OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
+
     /usr/bin/udp2raw -c -l "127.0.0.1:3333" -r "${SRV}:${PRT}" \
         -k "$KEY" --raw-mode faketcp --cipher-mode xor --auth-mode simple \
         -a --log-level 3 > "$LOGFILE" 2>&1 &
-    echo $! > "$PIDFILE"; sleep 2
+    echo $! > "$PIDFILE"
+    sleep 2
     kill -0 $(cat "$PIDFILE") 2>/dev/null && echo "OK" || { echo "FAIL"; return 1; }
 }
+
 do_stop() {
-    [ -f /tmp/udp2raw_srv ] && { . /tmp/udp2raw_srv; iptables -D OUTPUT -p tcp --dport "${PRT:-4096}" --tcp-flags RST RST -j DROP 2>/dev/null; }
-    [ -f "$PIDFILE" ] && kill $(cat "$PIDFILE") 2>/dev/null; rm -f "$PIDFILE"; killall udp2raw 2>/dev/null
+    # Remove RST rule
+    [ -f /tmp/udp2raw_srv ] && {
+        . /tmp/udp2raw_srv
+        iptables -D OUTPUT -p tcp --dport "${PRT:-4096}" --tcp-flags RST RST -j DROP 2>/dev/null
+    }
+    [ -f "$PIDFILE" ] && kill $(cat "$PIDFILE") 2>/dev/null
+    rm -f "$PIDFILE"
+    killall udp2raw 2>/dev/null
 }
-case "${1:-}" in start) do_start;; stop) do_stop;; restart) do_stop; sleep 2; do_start;;
-status) [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null && echo "RUNNING" || echo "STOPPED";;
-*) echo "Usage: udp2raw-ctl {start|stop|restart|status}";; esac
+
+case "${1:-}" in
+    start)   do_start ;;
+    stop)    do_stop ;;
+    restart) do_stop; sleep 2; do_start ;;
+    status)  [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null && echo "RUNNING" || echo "STOPPED" ;;
+    *)       echo "Usage: udp2raw-ctl {start|stop|restart|status}" ;;
+esac
 CTLEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-ctl"
 
 ############################################################
-# 3. fl-vpn-start — only udp2raw, with domain resolution
-#    OpenVPN is managed by standard Padavan VPN client
+# 3. fl-vpn-start — iterate servers, resolve DNS, start tunnel
 ############################################################
 cat > "$UDP2RAW_DIR/files/fl-vpn-start" << 'VPNEOF'
 #!/bin/sh
@@ -82,12 +99,15 @@ SKIP=$(cat /tmp/vpn_skip 2>/dev/null || echo "-1")
 OK=0
 echo "$SERVERS" | tr '>' '\n' > /tmp/vpn_srvlist
 
-# DNS resolver
+# Resolve domain to IP
 resolve_host() {
     local H="$1"
+    # Already IP?
     echo "$H" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && { echo "$H"; return; }
+    # nslookup
     local IP=$(nslookup "$H" 2>/dev/null | awk '/^Address/{if(NR>2)print $NF}' | head -1)
     echo "$IP" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && { echo "$IP"; return; }
+    # ping fallback
     IP=$(ping -c1 -W3 "$H" 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
     [ -n "$IP" ] && echo "$IP"
 }
@@ -96,8 +116,13 @@ IDX=0
 while IFS='' read -r line; do
     [ -z "$line" ] && continue
     echo "$line" | grep -q "^#" && continue
-    S=$(echo "$line"|cut -d: -f1); P=$(echo "$line"|cut -d: -f2); K=$(echo "$line"|cut -d: -f3-)
-    [ -z "$S" ] && continue; [ -z "$P" ] && P=4096; [ -z "$K" ] && K=changeme
+
+    S=$(echo "$line"|cut -d: -f1)
+    P=$(echo "$line"|cut -d: -f2)
+    K=$(echo "$line"|cut -d: -f3-)
+    [ -z "$S" ] && continue
+    [ -z "$P" ] && P=4096
+    [ -z "$K" ] && K=changeme
 
     if [ "$IDX" -le "$SKIP" ] && [ "$SKIP" -ge 0 ]; then
         IDX=$((IDX+1)); continue
@@ -105,28 +130,36 @@ while IFS='' read -r line; do
 
     echo ">>> [$IDX] $S:$P"
 
+    # Resolve
     SIP=$(resolve_host "$S")
     if [ -z "$SIP" ]; then
         echo "  DNS fail: $S"; IDX=$((IDX+1)); continue
     fi
     [ "$SIP" != "$S" ] && echo "  resolved: $S -> $SIP"
 
+    # Ping test
     ping -c2 -W4 "$SIP" >/dev/null 2>&1 || { echo "  unreachable: $SIP"; IDX=$((IDX+1)); continue; }
 
-    # Write server info for udp2raw-ctl
+    # Write server config for udp2raw-ctl
     echo "SRV=$SIP" > /tmp/udp2raw_srv
     echo "PRT=$P" >> /tmp/udp2raw_srv
     echo "KEY=$K" >> /tmp/udp2raw_srv
 
-    # Start udp2raw
-    udp2raw-ctl start || { IDX=$((IDX+1)); continue; }
+    # Start udp2raw tunnel
+    udp2raw-ctl start
+    if [ $? -ne 0 ]; then
+        echo "  udp2raw start failed"; IDX=$((IDX+1)); continue
+    fi
 
-    # Route server IP via WAN (so it doesn't loop through VPN)
-    WG=$(ip route|grep default|awk '{print $3}'|head -1)
-    WI=$(ip route|grep default|awk '{print $5}'|head -1)
-    [ -n "$WG" ] && { ip route del "$SIP/32" 2>/dev/null; ip route add "$SIP/32" via "$WG" dev "$WI"; }
+    # Route server IP via WAN (bypass VPN)
+    WG=$(ip route | grep default | awk '{print $3}' | head -1)
+    WI=$(ip route | grep default | awk '{print $5}' | head -1)
+    [ -n "$WG" ] && {
+        ip route del "$SIP/32" 2>/dev/null
+        ip route add "$SIP/32" via "$WG" dev "$WI"
+    }
 
-    echo "  udp2raw OK -> $S ($SIP):$P"
+    echo "  TUNNEL UP -> $S ($SIP):$P"
     echo "$IDX" > /tmp/vpn_idx
 
     nvram set udp2raw_status="CONNECTED"
@@ -137,15 +170,16 @@ while IFS='' read -r line; do
     IDX=$((IDX+1)); sleep 2
 done < /tmp/vpn_srvlist
 
+# Retry from beginning if we skipped
 if [ "$OK" != "1" ] && [ "$SKIP" -ge 0 ]; then
     echo "Retry from 0"; echo "-1" > /tmp/vpn_skip; exec fl-vpn-start
 fi
-[ "$OK" != "1" ] && { nvram set udp2raw_status="ALL FAILED"; echo "FATAL: all failed"; }
+[ "$OK" != "1" ] && { nvram set udp2raw_status="ALL FAILED"; echo "FATAL: all servers failed"; }
 VPNEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-start"
 
 ############################################################
-# 4. fl-vpn-stop — only udp2raw
+# 4. fl-vpn-stop — stop tunnel, clean route
 ############################################################
 cat > "$UDP2RAW_DIR/files/fl-vpn-stop" << 'STOPEOF'
 #!/bin/sh
@@ -157,25 +191,25 @@ STOPEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-stop"
 
 ############################################################
-# 5. fl-vpn-switch — next server
+# 5. fl-vpn-switch — try next server
 ############################################################
 cat > "$UDP2RAW_DIR/files/fl-vpn-switch" << 'SWEOF'
 #!/bin/sh
-C=$(cat /tmp/vpn_idx 2>/dev/null||echo 0)
+C=$(cat /tmp/vpn_idx 2>/dev/null || echo 0)
 echo "$C" > /tmp/vpn_skip
 fl-vpn-stop; sleep 1; fl-vpn-start &
 SWEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-switch"
 
 ############################################################
-# 6. fl-vpn-watchdog — cron, health check
+# 6. fl-vpn-watchdog — cron, check udp2raw alive
 ############################################################
 cat > "$UDP2RAW_DIR/files/fl-vpn-watchdog" << 'WDEOF'
 #!/bin/sh
 LOG="/tmp/fl-vpn-wd.log"
 [ -f "$LOG" ] && [ $(wc -c < "$LOG") -gt 20000 ] && tail -30 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
 
-# Self-install cron
+# Self-install cron (every minute)
 cru l 2>/dev/null | grep -q "fl-vpn-watchdog" || {
     cru a fl_vpn_wd "*/1 * * * * /usr/bin/fl-vpn-watchdog"
     echo "$(date '+%H:%M') cron installed" >> "$LOG"
@@ -183,34 +217,36 @@ cru l 2>/dev/null | grep -q "fl-vpn-watchdog" || {
 
 EN=$(nvram get udp2raw_enable 2>/dev/null)
 
+# Disabled? Stop everything
 if [ "$EN" != "1" ]; then
-    pidof udp2raw >/dev/null 2>&1 && { fl-vpn-stop; echo "$(date '+%H:%M') disabled, stopped" >> "$LOG"; }
+    pidof udp2raw >/dev/null 2>&1 && {
+        fl-vpn-stop
+        echo "$(date '+%H:%M') disabled, stopped" >> "$LOG"
+    }
     exit 0
 fi
 
-# Is udp2raw running?
+# Enabled — check if udp2raw process alive
 if ! pidof udp2raw >/dev/null 2>&1; then
     echo "$(date '+%H:%M') udp2raw dead, starting" >> "$LOG"
     fl-vpn-start >> "$LOG" 2>&1 &
     exit 0
 fi
 
-# Is VPN tunnel alive? (OpenVPN managed by Padavan)
+# Optional: check if tunnel actually works by pinging through VPN
+# (only if OpenVPN is also connected — tun interface exists)
 TUN=""
 for t in tun0 tun1 tun2; do
-    ip link show "$t" 2>/dev/null|grep -q UP && { TUN="$t"; break; }
+    ip link show "$t" 2>/dev/null | grep -q UP && { TUN="$t"; break; }
 done
-
 if [ -n "$TUN" ]; then
-    # Tunnel exists — ping gateway
     GW=$(ip route show dev "$TUN" 2>/dev/null | awk '/via/{print $3}' | head -1)
     [ -z "$GW" ] && GW="10.8.0.1"
     ping -c2 -W5 -I "$TUN" "$GW" >/dev/null 2>&1 || {
-        echo "$(date '+%H:%M') gw unreachable ($GW), switching server" >> "$LOG"
+        echo "$(date '+%H:%M') tunnel dead (gw $GW unreachable), switching" >> "$LOG"
         fl-vpn-switch >> "$LOG" 2>&1 &
     }
 fi
-# If no TUN — OpenVPN is still connecting, that's normal. Wait.
 WDEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-watchdog"
 
@@ -219,19 +255,12 @@ chmod +x "$UDP2RAW_DIR/files/fl-vpn-watchdog"
 ############################################################
 cat > "$UDP2RAW_DIR/files/fl-vpn-status" << 'STEOF'
 #!/bin/sh
-echo "=== MILLENIUM VPN ==="
+echo "=== MILLENIUM VPN (udp2raw) ==="
 echo -n "Enable:  "; nvram get udp2raw_enable 2>/dev/null || echo "0"
 echo -n "Status:  "; nvram get udp2raw_status 2>/dev/null || echo "?"
 echo -n "Server:  "; nvram get udp2raw_active 2>/dev/null || echo "-"
 echo -n "udp2raw: "; pidof udp2raw >/dev/null && echo "ON ($(pidof udp2raw))" || echo "OFF"
 echo -n "openvpn: "; pidof openvpn >/dev/null && echo "ON ($(pidof openvpn))" || echo "OFF"
-for t in tun0 tun1 tun2; do
-    ip link show "$t" 2>/dev/null|grep -q UP && {
-        VIP=$(ip -4 addr show "$t"|awk '/inet /{print $2}'|cut -d/ -f1)
-        echo "tunnel:  $t $VIP"
-        break
-    }
-done
 STEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-status"
 
@@ -296,7 +325,7 @@ cat > "$WWW/millenium_status.asp" << 'STATUSEOF'
 STATUSEOF
 
 ############################################################
-# 12. ASP page — simple: servers + enable + status
+# 12. ASP page — udp2raw tunnel settings only
 ############################################################
 rm -f "$WWW/Advanced_udp2raw.asp"
 
@@ -381,13 +410,13 @@ function update_status(){
     var info = document.getElementById('vpn_info');
     if(!el) return;
     if(s == 'CONNECTED'){
-        el.innerHTML = '<span class="label label-success" style="font-size:14px;padding:5px 12px;">\u25CF \u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e</span>';
+        el.innerHTML = '<span class="label label-success" style="font-size:14px;padding:5px 12px;">\u25CF \u0422\u0443\u043d\u043d\u0435\u043b\u044c \u0430\u043a\u0442\u0438\u0432\u0435\u043d</span>';
         info.innerHTML = m_active ? '\u0421\u0435\u0440\u0432\u0435\u0440: <b>'+m_active+'</b>' : '';
     } else if(s == 'CONNECTING...'){
         el.innerHTML = '<span class="label label-warning" style="font-size:14px;padding:5px 12px;">\u25CF \u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435...</span>';
         info.innerHTML = '<i>\u041f\u0435\u0440\u0435\u0431\u043e\u0440 \u0441\u0435\u0440\u0432\u0435\u0440\u043e\u0432...</i>';
     } else {
-        el.innerHTML = '<span class="label label-important" style="font-size:14px;padding:5px 12px;">\u25cb \u041e\u0442\u043a\u043b\u044e\u0447\u0435\u043d\u043e</span>';
+        el.innerHTML = '<span class="label label-important" style="font-size:14px;padding:5px 12px;">\u25cb \u0422\u0443\u043d\u043d\u0435\u043b\u044c \u0432\u044b\u043a\u043b.</span>';
         info.innerHTML = (s != 'DISCONNECTED' && s) ? '<span style="color:#c00">'+s+'</span>' : '';
     }
 }
@@ -466,10 +495,10 @@ function done_validating(action){}
                     <div class="round_bottom">
 
                         <div class="alert alert-info" style="margin:10px;">
-                            udp2raw &#x442;&#x443;&#x43d;&#x43d;&#x435;&#x43b;&#x44c; &#x434;&#x43b;&#x44f; &#x43e;&#x431;&#x445;&#x43e;&#x434;&#x430; DPI.
-                            OpenVPN &#x43d;&#x430;&#x441;&#x442;&#x440;&#x430;&#x438;&#x432;&#x430;&#x435;&#x442;&#x441;&#x44f; &#x432;
+                            udp2raw &#x442;&#x443;&#x43d;&#x43d;&#x435;&#x43b;&#x44c; &mdash; &#x43e;&#x431;&#x43e;&#x440;&#x430;&#x447;&#x438;&#x432;&#x430;&#x435;&#x442; UDP &#x432; FakeTCP &#x434;&#x43b;&#x44f; &#x43e;&#x431;&#x445;&#x43e;&#x434;&#x430; DPI.
+                            <br>OpenVPN &#x43d;&#x430;&#x441;&#x442;&#x440;&#x430;&#x438;&#x432;&#x430;&#x435;&#x442;&#x441;&#x44f; &#x432;
                             <a href="/vpncli.asp"><b>VPN &#x43a;&#x43b;&#x438;&#x435;&#x43d;&#x442;</b></a>
-                            &#x441; remote 127.0.0.1 3333.
+                            (remote 127.0.0.1:3333).
                         </div>
 
                         <!-- STATUS -->
@@ -481,7 +510,7 @@ function done_validating(action){}
                         <!-- ENABLE -->
                         <table class="table">
                             <tr>
-                                <th width="50%" style="border-top:0 none;">&#x412;&#x43a;&#x43b;&#x44e;&#x447;&#x438;&#x442;&#x44c; udp2raw</th>
+                                <th width="50%" style="border-top:0 none;">&#x412;&#x43a;&#x43b;&#x44e;&#x447;&#x438;&#x442;&#x44c; udp2raw &#x442;&#x443;&#x43d;&#x43d;&#x435;&#x43b;&#x44c;</th>
                                 <td style="border-top:0 none;">
                                     <div class="main_itoggle">
                                         <div id="udp2raw_enable_on_of">
@@ -500,7 +529,7 @@ function done_validating(action){}
                             </tr>
                         </table>
 
-                        <!-- SERVERS -->
+                        <!-- CONFIG -->
                         <div id="cfg_main" style="display:none;">
                         <table class="table">
                             <tr><th colspan="2" style="background:#E3E3E3;">&#x421;&#x435;&#x440;&#x432;&#x435;&#x440;&#x44b; udp2raw</th></tr>
@@ -512,7 +541,8 @@ function done_validating(action){}
                                     <div class="help-text">
                                         &#x424;&#x43e;&#x440;&#x43c;&#x430;&#x442;: &#x425;&#x41e;&#x421;&#x422;:&#x41f;&#x41e;&#x420;&#x422;:&#x41f;&#x410;&#x420;&#x41e;&#x41b;&#x42c; &mdash;
                                         &#x434;&#x43e;&#x43c;&#x435;&#x43d;&#x44b; &#x438;&#x43b;&#x438; IP, &#x43e;&#x434;&#x438;&#x43d; &#x43d;&#x430; &#x441;&#x442;&#x440;&#x43e;&#x43a;&#x443;.
-                                        &#x41f;&#x440;&#x438; &#x431;&#x43b;&#x43e;&#x43a;&#x438;&#x440;&#x43e;&#x432;&#x43a;&#x435; &mdash; &#x43f;&#x435;&#x440;&#x435;&#x43a;&#x43b;&#x44e;&#x447;&#x430;&#x435;&#x442;&#x441;&#x44f; &#x43d;&#x430; &#x441;&#x43b;&#x435;&#x434;&#x443;&#x44e;&#x449;&#x438;&#x439; &#x430;&#x432;&#x442;&#x43e;&#x43c;&#x430;&#x442;&#x438;&#x447;&#x435;&#x441;&#x43a;&#x438;.
+                                        &#x41f;&#x430;&#x440;&#x43e;&#x43b;&#x44c; &mdash; &#x44d;&#x442;&#x43e; &#x43f;&#x430;&#x440;&#x43e;&#x43b;&#x44c; udp2raw (-k), &#x43d;&#x435; OpenVPN!
+                                        <br>&#x41f;&#x440;&#x438; &#x43e;&#x442;&#x43a;&#x430;&#x437;&#x435; &mdash; &#x430;&#x432;&#x442;&#x43e;&#x43c;&#x430;&#x442;&#x438;&#x447;&#x435;&#x441;&#x43a;&#x438; &#x43f;&#x435;&#x440;&#x435;&#x43a;&#x43b;&#x44e;&#x447;&#x430;&#x435;&#x442;&#x441;&#x44f; &#x43d;&#x430; &#x441;&#x43b;&#x435;&#x434;&#x443;&#x44e;&#x449;&#x438;&#x439;.
                                     </div>
                                 </td>
                             </tr>
@@ -528,8 +558,8 @@ function done_validating(action){}
                                             onclick="applyRule();" value="&#x421;&#x43e;&#x445;&#x440;&#x430;&#x43d;&#x438;&#x442;&#x44c;">
                                     </center>
                                     <div class="help-text" style="text-align:center; margin-top:8px;">
-                                        udp2raw &#x43f;&#x43e;&#x434;&#x43a;&#x43b;&#x44e;&#x447;&#x438;&#x442;&#x441;&#x44f; &#x432; &#x442;&#x435;&#x447;&#x435;&#x43d;&#x438;&#x435; 1 &#x43c;&#x438;&#x43d;.
-                                        &#x421;&#x442;&#x430;&#x442;&#x443;&#x441; &#x43e;&#x431;&#x43d;&#x43e;&#x432;&#x43b;&#x44f;&#x435;&#x442;&#x441;&#x44f; &#x43a;&#x430;&#x436;&#x434;&#x44b;&#x435; 5 &#x441;&#x435;&#x43a;.
+                                        &#x422;&#x443;&#x43d;&#x43d;&#x435;&#x43b;&#x44c; &#x43f;&#x43e;&#x0434;&#x043a;&#x043b;&#x044e;&#x0447;&#x0438;&#x0442;&#x0441;&#x044f; &#x0430;&#x0432;&#x0442;&#x043e;&#x043c;&#x0430;&#x0442;&#x0438;&#x0447;&#x0435;&#x0441;&#x043a;&#x0438; &#x0432; &#x0442;&#x0435;&#x0447;&#x0435;&#x043d;&#x0438;&#x0435; 1 &#x043c;&#x0438;&#x043d;.
+                                        &#x0421;&#x0442;&#x0430;&#x0442;&#x0443;&#x0441; &#x043e;&#x0431;&#x043d;&#x043e;&#x0432;&#x043b;&#x044f;&#x0435;&#x0442;&#x0441;&#x044f; &#x043a;&#x0430;&#x0436;&#x0434;&#x044b;&#x0435; 5 &#x0441;&#x0435;&#x043a;.
                                     </div>
                                 </td>
                             </tr>
@@ -546,14 +576,13 @@ function done_validating(action){}
 </body>
 </html>
 ASPEOF
-echo "  Created Advanced_udp2raw.asp v3.1"
+echo "  Created Advanced_udp2raw.asp v4"
 
 ############################################################
 # 13. Patch state.js
 ############################################################
-echo ">>> Patching state.js menu..."
+echo ">>> Patching state.js..."
 STATEJS="$WWW/state.js"
-
 if [ -f "$STATEJS" ] && ! grep -q "Advanced_udp2raw" "$STATEJS"; then
     ML2_LINE=$(grep -n 'menuL2_link.*new Array' "$STATEJS" | head -1 | cut -d: -f1)
     if [ -n "$ML2_LINE" ]; then
@@ -562,7 +591,7 @@ menuL2_title.push(\"MILLENIUM VPN\");\\
 menuL2_link.push(\"Advanced_udp2raw.asp\");" "$STATEJS"
         echo "  OK: push() after line $ML2_LINE"
     else
-        echo "  WARN: menuL2_link not found"
+        echo "  WARN: menuL2_link not found, ASP fallback"
     fi
     grep -n "MILLENIUM\|udp2raw" "$STATEJS" | head -3
 else
@@ -605,12 +634,12 @@ fi
 
 ############################################################
 echo "============================================"
-echo "  MILLENIUM Group VPN — build ready v3.1"
-echo "  - udp2raw + domain resolution + failover"
-echo "  - OpenVPN = standard Padavan VPN client"
-echo "  - WebUI: servers + enable + auto-status"
-echo "  - Watchdog: cron, auto-failover"
-echo "  - nvram: 4 vars only"
+echo "  MILLENIUM Group VPN — build ready v4.0"
+echo "  - udp2raw 20230206.0 (mipsel) FakeTCP"
+echo "  - WebUI: серверы (домены+IP), авто-статус"
+echo "  - Failover + watchdog (cron)"
+echo "  - OpenVPN = стандартный VPN клиент Padavan"
+echo "  - nvram: 4 переменные"
 echo "============================================"
 
 echo "=== DIAGNOSTICS ==="
