@@ -558,24 +558,56 @@ echo ">>> Patching state.js menu..."
 STATEJS="$WWW/state.js"
 
 if [ -f "$STATEJS" ] && ! grep -q "Advanced_udp2raw" "$STATEJS"; then
-    # Find the VPN client menu entry and add after it
+    # Debug: show VPN menu area
+    echo "  --- state.js VPN section ---"
+    grep -n 'vpn\|VPN' "$STATEJS" | head -10
+    echo "  --- menuL2_num patterns ---"
+    grep -n 'menuL2_num' "$STATEJS" | tail -5
+    echo "  ---"
+
+    # Strategy: find vpncli.asp, then find the next line with "num" increment
     LINE=$(grep -n 'vpncli.asp' "$STATEJS" | tail -1 | cut -d: -f1)
     if [ -n "$LINE" ]; then
-        # Find next menuL2_num++ after this line
-        AFTER=$(tail -n +"$LINE" "$STATEJS" | grep -n 'menuL2_num++' | head -1 | cut -d: -f1)
-        if [ -n "$AFTER" ]; then
-            INSERT=$((LINE + AFTER))
+        # Search broader: num++, num ++, num+=, etc within 5 lines
+        INSERT=""
+        for OFFSET in 1 2 3 4 5; do
+            CHECK=$((LINE + OFFSET))
+            if sed -n "${CHECK}p" "$STATEJS" | grep -q 'num++\|num ++\|num+=\|num +='; then
+                INSERT=$CHECK
+                break
+            fi
+        done
+
+        if [ -n "$INSERT" ]; then
             sed -i "${INSERT}a\\
     menuL2_title[menuL2_num] = \"MILLENIUM VPN\";\\
     menuL2_link[menuL2_num] = \"Advanced_udp2raw.asp\";\\
     menuL2_num++;" "$STATEJS"
-            echo "  OK: menu item added after vpncli.asp (line $INSERT)"
+            echo "  OK: menu item added at line $((INSERT+1))"
         else
-            echo "  WARN: menuL2_num++ not found after vpncli.asp"
+            # Fallback: just insert 3 lines after vpncli.asp line + 2
+            INSERT=$((LINE + 2))
+            sed -i "${INSERT}a\\
+    menuL2_title[menuL2_num] = \"MILLENIUM VPN\";\\
+    menuL2_link[menuL2_num] = \"Advanced_udp2raw.asp\";\\
+    menuL2_num++;" "$STATEJS"
+            echo "  FALLBACK: menu item added at line $((INSERT+1)) (after vpncli +2)"
         fi
     else
-        echo "  WARN: vpncli.asp not found in state.js"
+        # No vpncli.asp — look for last menuL2_num++ anywhere
+        LAST=$(grep -n 'menuL2_num' "$STATEJS" | tail -1 | cut -d: -f1)
+        if [ -n "$LAST" ]; then
+            sed -i "${LAST}a\\
+    menuL2_title[menuL2_num] = \"MILLENIUM VPN\";\\
+    menuL2_link[menuL2_num] = \"Advanced_udp2raw.asp\";\\
+    menuL2_num++;" "$STATEJS"
+            echo "  FALLBACK2: menu item added after last menuL2 (line $LAST)"
+        else
+            echo "  ERROR: no menu anchor found in state.js"
+        fi
     fi
+    # Verify
+    grep -n "udp2raw\|MILLENIUM" "$STATEJS" | head -5
 else
     [ -f "$STATEJS" ] && echo "  ALREADY PATCHED" || echo "  WARN: state.js not found"
 fi
@@ -586,16 +618,27 @@ fi
 echo ">>> nvram defaults..."
 DEFAULTS_H="$TRUNK/user/shared/defaults.h"
 if [ -f "$DEFAULTS_H" ] && ! grep -q "udp2raw_enable" "$DEFAULTS_H"; then
-    # Find last NVRAM default and add ours
-    sed -i '/^$/N;/\n.*#endif/{
-        i\
-\t{ "udp2raw_enable", "0" },\
-\t{ "udp2raw_servers", "" },\
-\t{ "udp2raw_status", "" },\
-\t{ "udp2raw_active", "" },\
-\t{ "udp2raw_vpnip", "" },
-    }' "$DEFAULTS_H" 2>/dev/null || true
+    # Insert before the NULL terminator { 0, 0 } of router_defaults[] array
+    if grep -q '{ 0, 0 }' "$DEFAULTS_H"; then
+        sed -i '/{ 0, 0 }/i\\t{ "udp2raw_enable", "0" },\n\t{ "udp2raw_servers", "" },\n\t{ "udp2raw_status", "" },\n\t{ "udp2raw_active", "" },\n\t{ "udp2raw_vpnip", "" },' "$DEFAULTS_H"
+        echo "  defaults.h: inserted before { 0, 0 } terminator"
+    elif grep -q '{0, 0}' "$DEFAULTS_H"; then
+        sed -i '/{0, 0}/i\\t{ "udp2raw_enable", "0" },\n\t{ "udp2raw_servers", "" },\n\t{ "udp2raw_status", "" },\n\t{ "udp2raw_active", "" },\n\t{ "udp2raw_vpnip", "" },' "$DEFAULTS_H"
+        echo "  defaults.h: inserted before {0, 0} terminator"
+    else
+        # Fallback: find last entry { "xxx", "yyy" }, and append after it
+        LAST_ENTRY=$(grep -n '".*", ".*" },' "$DEFAULTS_H" | tail -1 | cut -d: -f1)
+        if [ -n "$LAST_ENTRY" ]; then
+            sed -i "${LAST_ENTRY}a\\\t{ \"udp2raw_enable\", \"0\" },\n\t{ \"udp2raw_servers\", \"\" },\n\t{ \"udp2raw_status\", \"\" },\n\t{ \"udp2raw_active\", \"\" },\n\t{ \"udp2raw_vpnip\", \"\" }," "$DEFAULTS_H"
+            echo "  defaults.h: appended after last entry (line $LAST_ENTRY)"
+        else
+            echo "  ERROR: cannot find insertion point in defaults.h"
+        fi
+    fi
+    # Verify insertion
+    grep -n "udp2raw" "$DEFAULTS_H" | head -5
 fi
+
 
 ############################################################
 # 14. Branding
