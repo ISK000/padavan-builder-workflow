@@ -1,20 +1,15 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v5.0
+# MILLENIUM Group — Padavan-NG pre-build v6.0
 #
-# Из коробки — после прошивки ничего не нужно настраивать
-# вручную. Всё работает через WebUI.
-#
-# Что включено:
-#   1. OpenVPN 2.6.14 + XOR patch (scramble obfuscate)
-#   2. WebUI branding (MILLENIUM Group)
-#   3. udp2raw 20230206.0 (mipsel) FakeTCP
-#   4. fl-vpn-* скрипты (start/stop/switch/watchdog/status)
-#   5. started_wan_hook.sh вшит в romfs — автозапуск
-#      watchdog при поднятии WAN, без ручных настроек
-#   6. WebUI страница MILLENIUM VPN (Advanced_udp2raw.asp)
-#   7. Меню patched (state.js)
-#   8. nvram defaults
+# Фиксы v6.0 относительно v5.0:
+#   - iptables RST suppression: -I OUTPUT 1 + dedup (было -A, не работало)
+#   - WebUI: action_script="restart_udp2raw" → VPN стартует по toggle+Save
+#   - WebUI: next_page="Advanced_udp2raw.asp" → страница не пропадает
+#   - WebUI: change_enabled() читает реальное состояние через getElementById
+#   - romfs: /sbin/restart_udp2raw — вызывается Padavan после сохранения
+#   - WAN hook: iptables RST rule при каждом поднятии WAN (до watchdog)
+#   - nvram: tun-mtu 1300 / mssfix 1260 по умолчанию (vpnc_cus3)
 ############################################################
 set -euo pipefail
 
@@ -22,9 +17,10 @@ TRUNK="padavan-ng/trunk"
 UDP2RAW_DIR="$TRUNK/user/udp2raw-tunnel"
 WWW="$TRUNK/user/www/n56u_ribbon_fixed"
 ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
+ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v5.0"
+echo "  MILLENIUM Group VPN — pre-build v6.0"
 echo "  Out of box — no manual setup required"
 echo "============================================"
 
@@ -77,6 +73,11 @@ echo "  OK: $(ls -lh $UDP2RAW_DIR/files/udp2raw | awk '{print $5}')"
 
 ############################################################
 # 4. udp2raw-ctl
+#
+# FIX v6.0: iptables использует -I OUTPUT 1 вместо -A OUTPUT.
+# В Padavan firewall есть правила DROP которые стоят в цепочке
+# раньше. -A добавляет в конец — RST не перехватывается до DROP.
+# Решение: сначала удаляем старое правило (dedup), потом -I pos 1.
 ############################################################
 echo ">>> [4] Scripts"
 cat > "$UDP2RAW_DIR/files/udp2raw-ctl" << 'CTLEOF'
@@ -87,9 +88,14 @@ LOGFILE="/tmp/udp2raw.log"
 do_start() {
     [ -f /tmp/udp2raw_srv ] && . /tmp/udp2raw_srv || { echo "No server config"; return 1; }
     [ -z "$SRV" ] && { echo "SRV empty"; return 1; }
+
     killall udp2raw 2>/dev/null; sleep 1
-    iptables -C OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null || \
-        iptables -A OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
+
+    # FIX v6.0: dedup + INSERT в позицию 1 (не APPEND в конец)
+    # -A не работает в Padavan — правила DROP стоят раньше в цепочке
+    iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
+    iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
+
     /usr/bin/udp2raw -c \
         -l "127.0.0.1:3333" \
         -r "${SRV}:${PRT}" \
@@ -294,14 +300,37 @@ chmod +x "$UDP2RAW_DIR/files/fl-vpn-status"
 echo "  Scripts OK"
 
 ############################################################
-# 10. WAN hook вшитый в romfs — КЛЮЧЕВОЕ для "из коробки"
+# 10. restart_udp2raw — action_script hook для Padavan WebUI
 #
-# /etc/storage/started_wan_hook.sh запускается Padavan
-# автоматически при каждом поднятии WAN интерфейса.
-# Watchdog стартует, ставит себя в cron, следит за туннелем.
-# Toggle в WebUI полностью управляет включением/выключением.
+# FIX v6.0: Padavan после сохранения формы запускает /sbin/restart_<script>.
+# Без этого скрипта toggle и "Сохранить" не запускали/останавливали VPN.
+# Теперь: Save → Padavan вызывает restart_udp2raw → fl-vpn-start/stop.
 ############################################################
-echo ">>> [5] WAN hook → romfs (out of box autostart)"
+echo ">>> [5] restart_udp2raw (Padavan action_script hook)"
+mkdir -p "$ROMFS_SBIN"
+
+cat > "$ROMFS_SBIN/restart_udp2raw" << 'RSTEOF'
+#!/bin/sh
+# Вызывается Padavan как action_script после сохранения WebUI формы.
+# action_script="restart_udp2raw" в Advanced_udp2raw.asp
+EN=$(nvram get udp2raw_enable 2>/dev/null)
+if [ "$EN" = "1" ]; then
+    /usr/bin/fl-vpn-start &
+else
+    /usr/bin/fl-vpn-stop
+fi
+RSTEOF
+chmod +x "$ROMFS_SBIN/restart_udp2raw"
+echo "  Created $ROMFS_SBIN/restart_udp2raw"
+
+############################################################
+# 11. WAN hook вшитый в romfs
+#
+# FIX v6.0: iptables RST suppression добавляем ДО запуска watchdog.
+# Из логов: без этого правила udp2raw застревал на handshake2
+# с "auth_verify failed" — ядро отправляло RST и сессия рвалась.
+############################################################
+echo ">>> [6] WAN hook → romfs (out of box autostart)"
 mkdir -p "$ROMFS_STORAGE"
 
 WAN_HOOK="$ROMFS_STORAGE/started_wan_hook.sh"
@@ -309,8 +338,15 @@ if [ -f "$WAN_HOOK" ]; then
     if ! grep -q "fl-vpn-watchdog" "$WAN_HOOK"; then
         cat >> "$WAN_HOOK" << 'HOOKEOF'
 
-# MILLENIUM VPN — udp2raw autostart
-sleep 5 && /usr/bin/fl-vpn-watchdog &
+# MILLENIUM VPN — udp2raw autostart v6.0
+# FIX: iptables RST suppression ДО watchdog — иначе handshake не проходит
+sleep 3
+PRT=$(nvram get udp2raw_servers 2>/dev/null | cut -d'>' -f1 | cut -d: -f2)
+if [ -n "$PRT" ] && echo "$PRT" | grep -qE '^[0-9]+$'; then
+    iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
+    iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
+fi
+sleep 2 && /usr/bin/fl-vpn-watchdog &
 HOOKEOF
         echo "  Appended to existing $WAN_HOOK"
     else
@@ -319,20 +355,28 @@ HOOKEOF
 else
     cat > "$WAN_HOOK" << 'HOOKEOF'
 #!/bin/sh
-# MILLENIUM VPN — udp2raw autostart
+# MILLENIUM VPN — udp2raw autostart v6.0
 # Запускается автоматически при поднятии WAN.
 # Watchdog ставит себя в cron и следит за туннелем.
-# Управление: WebUI → MILLENIUM VPN → toggle ON/OFF.
-sleep 5 && /usr/bin/fl-vpn-watchdog &
+
+# FIX v6.0: iptables RST suppression нужен ДО запуска udp2raw.
+# Без него клиент не проходит handshake2 (auth_verify failed в логах).
+sleep 3
+PRT=$(nvram get udp2raw_servers 2>/dev/null | cut -d'>' -f1 | cut -d: -f2)
+if [ -n "$PRT" ] && echo "$PRT" | grep -qE '^[0-9]+$'; then
+    iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
+    iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
+fi
+sleep 2 && /usr/bin/fl-vpn-watchdog &
 HOOKEOF
     echo "  Created $WAN_HOOK"
 fi
 chmod +x "$WAN_HOOK"
 
 ############################################################
-# 11. custom-extras
+# 12. custom-extras
 ############################################################
-echo ">>> [6] custom-extras"
+echo ">>> [7] custom-extras"
 CUSTOM_DIR="$TRUNK/user/custom-extras"
 if [ -d "$CUSTOM_DIR" ]; then
     mkdir -p "$CUSTOM_DIR/files/etc/storage/wireguard"
@@ -342,9 +386,9 @@ fi
 echo "  OK"
 
 ############################################################
-# 12. Patch user/Makefile
+# 13. Patch user/Makefile
 ############################################################
-echo ">>> [7] user/Makefile patch"
+echo ">>> [8] user/Makefile patch"
 UMAKEFILE="$TRUNK/user/Makefile"
 if ! grep -q "udp2raw-tunnel" "$UMAKEFILE"; then
     sed -i 's/for i in $(dir_y) ;/for i in $(dir_y) udp2raw-tunnel custom-extras ;/g' "$UMAKEFILE"
@@ -355,7 +399,7 @@ else
 fi
 
 ############################################################
-# 13. Makefile для udp2raw-tunnel
+# 14. Makefile для udp2raw-tunnel
 ############################################################
 cat > "$UDP2RAW_DIR/Makefile" << 'MKEOF'
 all:
@@ -378,15 +422,34 @@ clean:
 MKEOF
 
 ############################################################
-# 14. AJAX статус endpoint
+# 15. AJAX статус endpoint
 ############################################################
-echo ">>> [8] WebUI"
+echo ">>> [9] WebUI"
 cat > "$WWW/millenium_status.asp" << 'EOF'
 <% nvram_get_x("", "udp2raw_status"); %>|<% nvram_get_x("", "udp2raw_active"); %>
 EOF
 
 ############################################################
-# 15. ASP страница MILLENIUM VPN
+# 16. ASP страница MILLENIUM VPN v6.0
+#
+# FIX v6.0 относительно v5.0:
+#
+# 1. action_script="restart_udp2raw"
+#    Было: action_script="" → после Save Padavan ничего не запускал,
+#    VPN не стартовал. Теперь Padavan вызывает /sbin/restart_udp2raw.
+#
+# 2. next_page="Advanced_udp2raw.asp"
+#    Было: next_page="" → после Save браузер уходил на пустую страницу.
+#    Теперь редирект обратно на ту же страницу.
+#
+# 3. change_enabled() через getElementById
+#    Было: document.form.udp2raw_enable[0].checked — ненадёжно в Padavan,
+#    иногда form array не строился при загрузке.
+#    Теперь: getElementById('udp2raw_enable_1').checked — всегда работает.
+#
+# 4. Убран showLoading() из applyRule()
+#    В некоторых сборках Padavan showLoading() блокировал UI overlay
+#    и toggle визуально зависал (не реагировал на клики).
 ############################################################
 cat > "$WWW/Advanced_udp2raw.asp" << 'ASPEOF'
 <!DOCTYPE html>
@@ -410,7 +473,9 @@ cat > "$WWW/Advanced_udp2raw.asp" << 'ASPEOF'
 <script type="text/javascript" src="/popup.js"></script>
 <script>
 var $j = jQuery.noConflict();
-$j(document).ready(function(){ init_itoggle('udp2raw_enable', change_enabled); });
+$j(document).ready(function(){
+    init_itoggle('udp2raw_enable', change_enabled);
+});
 </script>
 <script>
 <% login_state_hook(); %>
@@ -420,72 +485,91 @@ var m_active  = '<% nvram_get_x("", "udp2raw_active"); %>';
 function initial(){
     show_banner(0); show_menu(7,-1,0); show_footer();
     change_enabled(); load_servers(); update_status(); load_body();
-    var ld=document.getElementById('Loading'); if(ld) ld.style.display='none';
+    var ld = document.getElementById('Loading');
+    if (ld) ld.style.display = 'none';
     inject_menu();
     setInterval(poll_status, 5000);
 }
 
 function poll_status(){
-    $j.get('/millenium_status.asp?t='+Date.now(), function(d){
-        var p=d.split('|');
-        if(p.length>=2){ m_status=p[0].trim(); m_active=p[1].trim(); update_status(); }
+    $j.get('/millenium_status.asp?t=' + Date.now(), function(d){
+        var p = d.split('|');
+        if (p.length >= 2){
+            m_status = p[0].trim();
+            m_active  = p[1].trim();
+            update_status();
+        }
     });
 }
 
 function inject_menu(){
-    var sub=document.getElementById('subMenu'); if(!sub) return;
-    if(sub.innerHTML.indexOf('Advanced_udp2raw')>=0) return;
-    var groups=sub.getElementsByClassName('accordion-group');
-    if(groups.length>0){
-        var d=document.createElement('div');
-        d.className='accordion-group';
-        d.innerHTML='<div class="accordion-heading"><a class="accordion-toggle" style="padding:5px 15px;" href="/Advanced_udp2raw.asp"><b>MILLENIUM VPN</b></a></div>';
+    var sub = document.getElementById('subMenu');
+    if (!sub) return;
+    if (sub.innerHTML.indexOf('Advanced_udp2raw') >= 0) return;
+    var groups = sub.getElementsByClassName('accordion-group');
+    if (groups.length > 0){
+        var d = document.createElement('div');
+        d.className = 'accordion-group';
+        d.innerHTML = '<div class="accordion-heading"><a class="accordion-toggle"'
+            + ' style="padding:5px 15px;" href="/Advanced_udp2raw.asp">'
+            + '<b>MILLENIUM VPN</b></a></div>';
         groups[groups.length-1].parentNode.appendChild(d);
     }
 }
 
 function update_status(){
-    var s=m_status||'DISCONNECTED';
-    var el=document.getElementById('vpn_status');
-    var info=document.getElementById('vpn_info');
-    if(!el) return;
-    if(s=='CONNECTED'){
-        el.innerHTML='<span class="label label-success" style="font-size:14px;padding:5px 12px;">&#x25CF; Туннель активен</span>';
-        info.innerHTML=m_active?'Сервер: <b>'+m_active+'</b>':'';
-    } else if(s=='CONNECTING...'){
-        el.innerHTML='<span class="label label-warning" style="font-size:14px;padding:5px 12px;">&#x25CF; Подключение...</span>';
-        info.innerHTML='<i>Перебор серверов...</i>';
+    var s    = m_status || 'DISCONNECTED';
+    var el   = document.getElementById('vpn_status');
+    var info = document.getElementById('vpn_info');
+    if (!el) return;
+    if (s == 'CONNECTED'){
+        el.innerHTML = '<span class="label label-success"'
+            + ' style="font-size:14px;padding:5px 12px;">&#x25CF; Туннель активен</span>';
+        info.innerHTML = m_active ? 'Сервер: <b>' + m_active + '</b>' : '';
+    } else if (s == 'CONNECTING...'){
+        el.innerHTML = '<span class="label label-warning"'
+            + ' style="font-size:14px;padding:5px 12px;">&#x25CF; Подключение...</span>';
+        info.innerHTML = '<i>Перебор серверов...</i>';
     } else {
-        el.innerHTML='<span class="label label-important" style="font-size:14px;padding:5px 12px;">&#x25CB; Туннель выкл.</span>';
-        info.innerHTML=(s&&s!='DISCONNECTED')?'<span style="color:#c00">'+s+'</span>':'';
+        el.innerHTML = '<span class="label label-important"'
+            + ' style="font-size:14px;padding:5px 12px;">&#x25CB; Туннель выкл.</span>';
+        info.innerHTML = (s && s != 'DISCONNECTED')
+            ? '<span style="color:#c00">' + s + '</span>' : '';
     }
 }
 
+// FIX v6.0: getElementById вместо form array — надёжнее в Padavan WebUI
 function change_enabled(){
-    var v=document.form.udp2raw_enable[0].checked;
-    showhide_div('cfg_main',v);
+    var r1      = document.getElementById('udp2raw_enable_1');
+    var enabled = r1 && r1.checked;
+    showhide_div('cfg_main', enabled);
 }
 
 function load_servers(){
-    var s=document.form.udp2raw_servers_h.value||'';
-    document.getElementById('srv_text').value=s.replace(/>/g,'\n');
+    var s = document.form.udp2raw_servers_h.value || '';
+    document.getElementById('srv_text').value = s.replace(/>/g, '\n');
 }
 
+// FIX v6.0:
+//   - убран showLoading() — блокировал UI overlay в ряде сборок Padavan
+//   - next_page → возврат на ту же страницу (было "" → пустая страница)
+//   - action_script → Padavan вызовет /sbin/restart_udp2raw после Save
 function applyRule(){
-    var sv=document.getElementById('srv_text').value;
-    sv=sv.replace(/\r\n/g,'\n').replace(/\n+/g,'\n').replace(/^\n|\n$/g,'');
-    document.form.udp2raw_servers.value=sv.replace(/\n/g,'>');
-    showLoading();
-    document.form.action_mode.value=" Apply ";
-    document.form.current_page.value="/Advanced_udp2raw.asp";
-    document.form.next_page.value="";
+    var sv = document.getElementById('srv_text').value;
+    sv = sv.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
+    document.form.udp2raw_servers.value  = sv.replace(/\n/g, '>');
+    document.form.action_mode.value      = ' Apply ';
+    document.form.current_page.value     = 'Advanced_udp2raw.asp';
+    document.form.next_page.value        = 'Advanced_udp2raw.asp';
+    document.form.action_script.value    = 'restart_udp2raw';
     document.form.submit();
 }
+
 function done_validating(action){}
 </script>
 <style>
-.help-text{color:#888;font-size:11px;margin-top:3px;}
-.status-box{background:#f5f5f5;border-radius:6px;padding:12px 16px;margin:10px;}
+.help-text  { color:#888; font-size:11px; margin-top:3px; }
+.status-box { background:#f5f5f5; border-radius:6px; padding:12px 16px; margin:10px; }
 </style>
 </head>
 <body onload="initial();" onunload="unload_body();">
@@ -498,18 +582,23 @@ function done_validating(action){}
 </div>
 <br>
 <div id="Loading" class="popup_bg"></div>
-<iframe name="hidden_frame" id="hidden_frame" src="" width="0" height="0" frameborder="0" style="position:absolute;"></iframe>
-<form method="post" name="form" id="ruleForm" action="/start_apply.htm" target="hidden_frame">
-<input type="hidden" name="current_page" value="Advanced_udp2raw.asp">
-<input type="hidden" name="next_page" value="">
-<input type="hidden" name="next_host" value="">
-<input type="hidden" name="sid_list" value="LANHostConfig;">
-<input type="hidden" name="group_id" value="">
-<input type="hidden" name="action_mode" value="">
-<input type="hidden" name="action_script" value="">
-<input type="hidden" name="flag" value="">
+<iframe name="hidden_frame" id="hidden_frame" src="" width="0" height="0"
+    frameborder="0" style="position:absolute;"></iframe>
+
+<form method="post" name="form" id="ruleForm"
+    action="/start_apply.htm" target="hidden_frame">
+<input type="hidden" name="current_page"  value="Advanced_udp2raw.asp">
+<input type="hidden" name="next_page"     value="Advanced_udp2raw.asp">
+<input type="hidden" name="next_host"     value="">
+<input type="hidden" name="sid_list"      value="LANHostConfig;">
+<input type="hidden" name="group_id"      value="">
+<input type="hidden" name="action_mode"   value="">
+<input type="hidden" name="action_script" value="restart_udp2raw">
+<input type="hidden" name="flag"          value="">
 <input type="hidden" name="udp2raw_servers" value="">
-<input type="hidden" name="udp2raw_servers_h" value="<% nvram_get_x("", "udp2raw_servers"); %>">
+<input type="hidden" name="udp2raw_servers_h"
+    value="<% nvram_get_x("", "udp2raw_servers"); %>">
+
 <div class="container-fluid"><div class="row-fluid">
   <div class="span3">
     <div class="well sidebar-nav side_nav" style="padding:0px;">
@@ -526,7 +615,8 @@ function done_validating(action){}
         <div class="alert alert-info" style="margin:10px;">
           <b>Как работает:</b> OpenVPN → 127.0.0.1:3333 → udp2raw (faketcp) → сервер<br>
           DPI видит обычный TCP. Туннель стартует автоматически при поднятии WAN.<br>
-          <b>VPN клиент:</b> <a href="/vpncli.asp">Настройки</a> → Удалённый сервер: <b>127.0.0.1</b>, порт: <b>3333</b>, транспорт: <b>UDP</b>
+          <b>VPN клиент:</b> <a href="/vpncli.asp">Настройки</a>
+          → Удалённый сервер: <b>127.0.0.1</b>, порт: <b>3333</b>, транспорт: <b>UDP</b>
         </div>
 
         <div class="status-box">
@@ -546,10 +636,14 @@ function done_validating(action){}
                 </div>
               </div>
               <div style="position:absolute;margin-left:-10000px;">
-                <input type="radio" name="udp2raw_enable" id="udp2raw_enable_1" class="input" value="1"
-                  onclick="change_enabled();" <% nvram_match_x("", "udp2raw_enable", "1", "checked"); %>>Да
-                <input type="radio" name="udp2raw_enable" id="udp2raw_enable_0" class="input" value="0"
-                  onclick="change_enabled();" <% nvram_match_x("", "udp2raw_enable", "0", "checked"); %>>Нет
+                <input type="radio" name="udp2raw_enable" id="udp2raw_enable_1"
+                    class="input" value="1"
+                    onclick="change_enabled();"
+                    <% nvram_match_x("", "udp2raw_enable", "1", "checked"); %>>Да
+                <input type="radio" name="udp2raw_enable" id="udp2raw_enable_0"
+                    class="input" value="0"
+                    onclick="change_enabled();"
+                    <% nvram_match_x("", "udp2raw_enable", "0", "checked"); %>>Нет
               </div>
             </td>
           </tr>
@@ -561,7 +655,8 @@ function done_validating(action){}
           <tr>
             <td colspan="2">
               <textarea id="srv_text" rows="6" wrap="off" spellcheck="false"
-                class="span12" style="font-family:'Courier New';font-size:12px;"
+                class="span12"
+                style="font-family:'Courier New';font-size:12px;"
                 placeholder="89.39.70.30:4096:millenium2026&#10;server2.example.com:4096:millenium2026&#10;185.x.x.x:4096:millenium2026"></textarea>
               <div class="help-text">
                 Формат: ХОСТ:ПОРТ:ПАРОЛЬ — домены или IP, один на строку.<br>
@@ -577,9 +672,9 @@ function done_validating(action){}
           <tr>
             <td style="border:0 none;text-align:center;">
               <input type="button" class="btn btn-primary" style="width:219px"
-                onclick="applyRule();" value="Сохранить">
+                onclick="applyRule();" value="Сохранить и применить">
               <div class="help-text" style="text-align:center;margin-top:8px;">
-                После сохранения туннель запустится автоматически в течение 1 минуты.<br>
+                Toggle ON/OFF + Сохранить = VPN запустится/остановится немедленно.<br>
                 Статус обновляется каждые 5 сек.
               </div>
             </td>
@@ -596,12 +691,12 @@ function done_validating(action){}
 </body>
 </html>
 ASPEOF
-echo "  Created Advanced_udp2raw.asp v5.0"
+echo "  Created Advanced_udp2raw.asp v6.0"
 
 ############################################################
-# 16. Patch state.js
+# 17. Patch state.js
 ############################################################
-echo ">>> [9] state.js menu"
+echo ">>> [10] state.js menu"
 STATEJS="$WWW/state.js"
 if [ -f "$STATEJS" ] && ! grep -q "Advanced_udp2raw" "$STATEJS"; then
     ML2_LINE=$(grep -n 'menuL2_link.*new Array' "$STATEJS" | head -1 | cut -d: -f1)
@@ -618,15 +713,24 @@ else
 fi
 
 ############################################################
-# 17. nvram defaults
+# 18. nvram defaults
+#
+# FIX v6.0: добавлены vpnc_cus3 defaults с tun-mtu 1300 mssfix 1260.
+# Из логов роутера: OpenVPN слал пакеты 1425 байт через udp2raw →
+# "huge packet warn" → нестабильное соединение.
+# vpnc_cus3 — nvram переменная для custom params в OpenVPN client WebUI.
+# После прошивки в разделе VPN Client → Custom Config будет стоять
+# tun-mtu 1300 / mssfix 1260 автоматически.
 ############################################################
-echo ">>> [10] nvram defaults"
+echo ">>> [11] nvram defaults"
 for F in \
     "$TRUNK/user/shared/defaults.h" \
     "$TRUNK/user/shared/defaults.c" \
     "$TRUNK/user/rc/defaults.c" \
     "$TRUNK/user/httpd/variables.c"; do
     [ -f "$F" ] && grep -q 'router_defaults\|nvram_pair' "$F" || continue
+
+    # udp2raw vars
     if ! grep -q "udp2raw_enable" "$F"; then
         for TERM in '{ 0, 0 }' '{0, 0}'; do
             if grep -q "$TERM" "$F"; then
@@ -636,12 +740,27 @@ for F in \
 \t{ \"udp2raw_servers\", \"\" },\\
 \t{ \"udp2raw_status\",  \"\" },\\
 \t{ \"udp2raw_active\",  \"\" }," "$F"
-                echo "  Added defaults to: $F"
+                echo "  Added udp2raw defaults to: $F"
                 break
             fi
         done
     else
-        echo "  Already patched: $F"
+        echo "  Already patched (udp2raw): $F"
+    fi
+
+    # FIX v6.0: OpenVPN MTU defaults (vpnc_cus3)
+    if ! grep -q "vpnc_cus3.*tun-mtu" "$F"; then
+        for TERM in '{ 0, 0 }' '{0, 0}'; do
+            if grep -q "$TERM" "$F"; then
+                LINE=$(grep -n "$TERM" "$F" | tail -1 | cut -d: -f1)
+                sed -i "${LINE}i\\
+\t{ \"vpnc_cus3\", \"tun-mtu 1300\\\\nmssfix 1260\" }," "$F"
+                echo "  Added vpnc_cus3 MTU defaults to: $F"
+                break
+            fi
+        done
+    else
+        echo "  vpnc_cus3 already patched: $F"
     fi
     break
 done
@@ -649,25 +768,28 @@ done
 ############################################################
 echo ""
 echo "============================================"
-echo "  MILLENIUM Group VPN — build ready v5.0"
+echo "  MILLENIUM Group VPN — build ready v6.0"
+echo ""
+echo "  Что исправлено vs v5.0:"
+echo "  - iptables: -I OUTPUT 1 + dedup (было -A)"
+echo "  - WebUI toggle+Save: теперь реально запускают VPN"
+echo "  - WebUI redirect: возврат на страницу после Save"
+echo "  - romfs: /sbin/restart_udp2raw (action_script hook)"
+echo "  - WAN hook: iptables RST при каждом поднятии WAN"
+echo "  - nvram: tun-mtu 1300 / mssfix 1260 по умолчанию"
 echo ""
 echo "  После прошивки — только 3 действия:"
 echo "  1. WebUI → MILLENIUM VPN → ввести серверы"
-echo "     → toggle ON → Сохранить"
+echo "     → toggle ON → Сохранить и применить"
 echo "  2. VPN клиент → remote 127.0.0.1, порт 3333"
 echo "  3. Готово. Всё работает само."
-echo ""
-echo "  Компоненты:"
-echo "  - OpenVPN 2.6.14 + XOR (scramble obfuscate)"
-echo "  - udp2raw 20230206.0 mipsel FakeTCP"
-echo "  - WAN hook в romfs (автостарт)"
-echo "  - Watchdog cron (failover серверов)"
-echo "  - WebUI MILLENIUM VPN"
 echo "============================================"
 
 echo ""
 echo "=== DIAGNOSTICS ==="
 ls -la "$UDP2RAW_DIR/files/" 2>/dev/null
+echo "--- /sbin/restart_udp2raw ---"
+cat "$ROMFS_SBIN/restart_udp2raw" 2>/dev/null || echo "NOT FOUND"
 echo "--- WAN hook ---"
 cat "$ROMFS_STORAGE/started_wan_hook.sh" 2>/dev/null || echo "NOT FOUND"
 ls "$WWW/Advanced_udp2raw.asp" "$WWW/millenium_status.asp" 2>/dev/null && echo "ASP OK"
