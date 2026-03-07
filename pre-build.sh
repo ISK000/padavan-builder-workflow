@@ -650,13 +650,20 @@ function applyRule(){
     document.form.action_mode.value   = ' Apply ';
     document.form.current_page.value  = 'Advanced_udp2raw.asp';
     document.form.next_page.value     = 'Advanced_udp2raw.asp';
-    // v8.0 FIX: передаём enable и servers как аргументы action_script.
+    // v8.0 FIX 1: передаём enable и servers как аргументы action_script.
     // restart_udp2raw сам сохранит в nvram — не зависит от variables.c.
     // % как разделитель (> вызывал shell-redirect).
     var scriptCmd = 'restart_udp2raw ' + en;
     if (srvPct.length > 0) { scriptCmd += ' ' + srvPct; }
     document.form.action_script.value = scriptCmd;
+
+    // v8.0 FIX 2 (CRITICAL): ПЕРЕЗАГРУЖАЕМ СТРАНИЦУ после submit.
+    // Форма уходит в hidden_frame — без этого основное окно
+    // НИКОГДА не обновляется и toggle показывает старые значения!
+    var btn = document.getElementById('save_btn');
+    if (btn) { btn.value = 'Сохранение...'; btn.disabled = true; }
     document.form.submit();
+    setTimeout(function(){ window.location.href = 'Advanced_udp2raw.asp'; }, 3500);
 }
 
 function done_validating(action){}
