@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v6.0
+# MILLENIUM Group — Padavan-NG pre-build v7.0
 #
-# Фиксы v6.0 относительно v5.0:
-#   - iptables RST suppression: -I OUTPUT 1 + dedup (было -A, не работало)
-#   - WebUI: action_script="restart_udp2raw" → VPN стартует по toggle+Save
-#   - WebUI: next_page="Advanced_udp2raw.asp" → страница не пропадает
-#   - WebUI: change_enabled() читает реальное состояние через getElementById
-#   - romfs: /sbin/restart_udp2raw — вызывается Padavan после сохранения
-#   - WAN hook: iptables RST rule при каждом поднятии WAN (до watchdog)
-#   - nvram: tun-mtu 1300 / mssfix 1260 по умолчанию (vpnc_cus3)
+# Что исправлено в v7.0 (root cause analysis по логам билда):
+#
+#  БАГИ v5.0/v6.0:
+#   1. variables.c НЕ патчился из-за break в цикле defaults.
+#      Padavan httpd хранит WHITELIST nvram-переменных в
+#      user/httpd/variables.c — переменных не в этом файле
+#      httpd просто игнорирует при сохранении формы.
+#      Результат: toggle и серверы сбрасываются после Save.
+#      ИСПРАВЛЕНИЕ: отдельный шаг патчинга variables.c.
+#
+#   2. itoggle не гарантирует синхронизацию radio buttons
+#      перед submit формы в некоторых версиях Padavan.
+#      Результат: udp2raw_enable = 0 в POST несмотря на
+#      визуальное положение toggle.
+#      ИСПРАВЛЕНИЕ: полностью заменить itoggle на CSS toggle
+#      с hidden input — не зависит от библиотек.
 ############################################################
 set -euo pipefail
 
@@ -20,8 +28,8 @@ ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
 ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v6.0"
-echo "  Out of box — no manual setup required"
+echo "  MILLENIUM Group VPN — pre-build v7.0"
+echo "  Definitive fix: variables.c + CSS toggle"
 echo "============================================"
 
 ############################################################
@@ -73,11 +81,6 @@ echo "  OK: $(ls -lh $UDP2RAW_DIR/files/udp2raw | awk '{print $5}')"
 
 ############################################################
 # 4. udp2raw-ctl
-#
-# FIX v6.0: iptables использует -I OUTPUT 1 вместо -A OUTPUT.
-# В Padavan firewall есть правила DROP которые стоят в цепочке
-# раньше. -A добавляет в конец — RST не перехватывается до DROP.
-# Решение: сначала удаляем старое правило (dedup), потом -I pos 1.
 ############################################################
 echo ">>> [4] Scripts"
 cat > "$UDP2RAW_DIR/files/udp2raw-ctl" << 'CTLEOF'
@@ -91,8 +94,7 @@ do_start() {
 
     killall udp2raw 2>/dev/null; sleep 1
 
-    # FIX v6.0: dedup + INSERT в позицию 1 (не APPEND в конец)
-    # -A не работает в Padavan — правила DROP стоят раньше в цепочке
+    # dedup + INSERT в позицию 1 (не APPEND в конец)
     iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
     iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
 
@@ -301,18 +303,13 @@ echo "  Scripts OK"
 
 ############################################################
 # 10. restart_udp2raw — action_script hook для Padavan WebUI
-#
-# FIX v6.0: Padavan после сохранения формы запускает /sbin/restart_<script>.
-# Без этого скрипта toggle и "Сохранить" не запускали/останавливали VPN.
-# Теперь: Save → Padavan вызывает restart_udp2raw → fl-vpn-start/stop.
 ############################################################
-echo ">>> [5] restart_udp2raw (Padavan action_script hook)"
+echo ">>> [5] restart_udp2raw (action_script hook)"
 mkdir -p "$ROMFS_SBIN"
 
 cat > "$ROMFS_SBIN/restart_udp2raw" << 'RSTEOF'
 #!/bin/sh
 # Вызывается Padavan как action_script после сохранения WebUI формы.
-# action_script="restart_udp2raw" в Advanced_udp2raw.asp
 EN=$(nvram get udp2raw_enable 2>/dev/null)
 if [ "$EN" = "1" ]; then
     /usr/bin/fl-vpn-start &
@@ -325,12 +322,8 @@ echo "  Created $ROMFS_SBIN/restart_udp2raw"
 
 ############################################################
 # 11. WAN hook вшитый в romfs
-#
-# FIX v6.0: iptables RST suppression добавляем ДО запуска watchdog.
-# Из логов: без этого правила udp2raw застревал на handshake2
-# с "auth_verify failed" — ядро отправляло RST и сессия рвалась.
 ############################################################
-echo ">>> [6] WAN hook → romfs (out of box autostart)"
+echo ">>> [6] WAN hook → romfs"
 mkdir -p "$ROMFS_STORAGE"
 
 WAN_HOOK="$ROMFS_STORAGE/started_wan_hook.sh"
@@ -338,8 +331,7 @@ if [ -f "$WAN_HOOK" ]; then
     if ! grep -q "fl-vpn-watchdog" "$WAN_HOOK"; then
         cat >> "$WAN_HOOK" << 'HOOKEOF'
 
-# MILLENIUM VPN — udp2raw autostart v6.0
-# FIX: iptables RST suppression ДО watchdog — иначе handshake не проходит
+# MILLENIUM VPN v7.0 — udp2raw autostart
 sleep 3
 PRT=$(nvram get udp2raw_servers 2>/dev/null | cut -d'>' -f1 | cut -d: -f2)
 if [ -n "$PRT" ] && echo "$PRT" | grep -qE '^[0-9]+$'; then
@@ -355,12 +347,8 @@ HOOKEOF
 else
     cat > "$WAN_HOOK" << 'HOOKEOF'
 #!/bin/sh
-# MILLENIUM VPN — udp2raw autostart v6.0
+# MILLENIUM VPN v7.0 — udp2raw autostart
 # Запускается автоматически при поднятии WAN.
-# Watchdog ставит себя в cron и следит за туннелем.
-
-# FIX v6.0: iptables RST suppression нужен ДО запуска udp2raw.
-# Без него клиент не проходит handshake2 (auth_verify failed в логах).
 sleep 3
 PRT=$(nvram get udp2raw_servers 2>/dev/null | cut -d'>' -f1 | cut -d: -f2)
 if [ -n "$PRT" ] && echo "$PRT" | grep -qE '^[0-9]+$'; then
@@ -380,8 +368,6 @@ echo ">>> [7] custom-extras"
 CUSTOM_DIR="$TRUNK/user/custom-extras"
 if [ -d "$CUSTOM_DIR" ]; then
     mkdir -p "$CUSTOM_DIR/files/etc/storage/wireguard"
-    [ -f "$CUSTOM_DIR/Makefile" ] && ! grep -q "mkdir -p" "$CUSTOM_DIR/Makefile" && \
-        sed -i '/ROMFSINST.*wireguard/i\\tmkdir -p $(ROOTDIR)/romfs/etc/storage/wireguard' "$CUSTOM_DIR/Makefile"
 fi
 echo "  OK"
 
@@ -430,26 +416,21 @@ cat > "$WWW/millenium_status.asp" << 'EOF'
 EOF
 
 ############################################################
-# 16. ASP страница MILLENIUM VPN v6.0
+# 16. ASP страница MILLENIUM VPN v7.0
 #
-# FIX v6.0 относительно v5.0:
+# КЛЮЧЕВЫЕ ИЗМЕНЕНИЯ v7.0:
 #
-# 1. action_script="restart_udp2raw"
-#    Было: action_script="" → после Save Padavan ничего не запускал,
-#    VPN не стартовал. Теперь Padavan вызывает /sbin/restart_udp2raw.
+# A) CSS TOGGLE вместо itoggle:
+#    Причина: itoggle не гарантирует синхронизацию radio button
+#    при submit формы (особенно в версиях Padavan 3.4.x).
+#    Новый toggle — чистый CSS checkbox + hidden input
+#    "udp2raw_enable" который ВСЕГДА правильно устанавливается
+#    через onEnableChange(). Нет зависимости от библиотек.
 #
-# 2. next_page="Advanced_udp2raw.asp"
-#    Было: next_page="" → после Save браузер уходил на пустую страницу.
-#    Теперь редирект обратно на ту же страницу.
-#
-# 3. change_enabled() через getElementById
-#    Было: document.form.udp2raw_enable[0].checked — ненадёжно в Padavan,
-#    иногда form array не строился при загрузке.
-#    Теперь: getElementById('udp2raw_enable_1').checked — всегда работает.
-#
-# 4. Убран showLoading() из applyRule()
-#    В некоторых сборках Padavan showLoading() блокировал UI overlay
-#    и toggle визуально зависал (не реагировал на клики).
+# B) HIDDEN INPUT вместо radio buttons:
+#    <input type="hidden" name="udp2raw_enable" id="udp2raw_enable_val">
+#    Значение устанавливается JS при клике на toggle.
+#    Гарантированно попадает в POST при submit формы.
 ############################################################
 cat > "$WWW/Advanced_udp2raw.asp" << 'ASPEOF'
 <!DOCTYPE html>
@@ -463,19 +444,55 @@ cat > "$WWW/Advanced_udp2raw.asp" << 'ASPEOF'
 <link rel="icon" href="images/favicon.png">
 <link rel="stylesheet" type="text/css" href="/bootstrap/css/bootstrap.min.css">
 <link rel="stylesheet" type="text/css" href="/bootstrap/css/main.css">
-<link rel="stylesheet" type="text/css" href="/bootstrap/css/engage.itoggle.css">
 <script type="text/javascript" src="/jquery.js"></script>
 <script type="text/javascript" src="/bootstrap/js/bootstrap.min.js"></script>
-<script type="text/javascript" src="/bootstrap/js/engage.itoggle.min.js"></script>
 <script type="text/javascript" src="/state.js"></script>
 <script type="text/javascript" src="/general.js"></script>
-<script type="text/javascript" src="/itoggle.js"></script>
 <script type="text/javascript" src="/popup.js"></script>
+<style>
+/* ── CSS Toggle (без зависимости от itoggle) ── */
+.mil-switch {
+    position: relative;
+    display: inline-block;
+    width: 60px;
+    height: 30px;
+    vertical-align: middle;
+    cursor: pointer;
+}
+.mil-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+.mil-slider {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: #ccc;
+    border-radius: 30px;
+    transition: .3s;
+}
+.mil-slider:before {
+    position: absolute;
+    content: "";
+    height: 22px; width: 22px;
+    left: 4px; top: 4px;
+    background: #fff;
+    border-radius: 50%;
+    transition: .3s;
+    box-shadow: 0 1px 3px rgba(0,0,0,.3);
+}
+.mil-switch input:checked + .mil-slider { background: #5cb85c; }
+.mil-switch input:checked + .mil-slider:before { transform: translateX(30px); }
+.mil-toggle-label {
+    display: inline-block;
+    margin-left: 10px;
+    font-size: 14px;
+    font-weight: bold;
+    vertical-align: middle;
+    min-width: 36px;
+}
+/* ── Остальные стили ── */
+.help-text  { color: #888; font-size: 11px; margin-top: 3px; }
+.status-box { background: #f5f5f5; border-radius: 6px; padding: 12px 16px; margin: 10px; }
+</style>
 <script>
 var $j = jQuery.noConflict();
-$j(document).ready(function(){
-    init_itoggle('udp2raw_enable', change_enabled);
-});
 </script>
 <script>
 <% login_state_hook(); %>
@@ -484,7 +501,10 @@ var m_active  = '<% nvram_get_x("", "udp2raw_active"); %>';
 
 function initial(){
     show_banner(0); show_menu(7,-1,0); show_footer();
-    change_enabled(); load_servers(); update_status(); load_body();
+    load_body();
+    load_servers();
+    syncToggle();
+    update_status();
     var ld = document.getElementById('Loading');
     if (ld) ld.style.display = 'none';
     inject_menu();
@@ -538,39 +558,59 @@ function update_status(){
     }
 }
 
-// FIX v6.0: getElementById вместо form array — надёжнее в Padavan WebUI
+/* ─────────────────────────────────────────────
+   CSS TOGGLE — FIX v7.0
+   hidden input "udp2raw_enable" — единственный
+   источник правды для формы. Никаких radio buttons,
+   никакого itoggle.
+   ───────────────────────────────────────────── */
+function syncToggle(){
+    var val = document.getElementById('udp2raw_enable_val').value;
+    var cb  = document.getElementById('enable_cb');
+    cb.checked = (val === '1');
+    refreshToggleLabel(cb.checked);
+    change_enabled();
+}
+
+function onEnableChange(cb){
+    document.getElementById('udp2raw_enable_val').value = cb.checked ? '1' : '0';
+    refreshToggleLabel(cb.checked);
+    change_enabled();
+}
+
+function refreshToggleLabel(checked){
+    var lbl = document.getElementById('toggle_lbl');
+    if (!lbl) return;
+    lbl.innerHTML = checked
+        ? '<span style="color:#3c763d;font-weight:bold">ON</span>'
+        : '<span style="color:#999">OFF</span>';
+}
+
 function change_enabled(){
-    var r1      = document.getElementById('udp2raw_enable_1');
-    var enabled = r1 && r1.checked;
+    var enabled = document.getElementById('enable_cb').checked;
     showhide_div('cfg_main', enabled);
 }
 
 function load_servers(){
-    var s = document.form.udp2raw_servers_h.value || '';
-    document.getElementById('srv_text').value = s.replace(/>/g, '\n');
+    var fld = document.getElementById('udp2raw_servers_stored');
+    if (!fld) return;
+    document.getElementById('srv_text').value = fld.value.replace(/>/g, '\n');
 }
 
-// FIX v6.0:
-//   - убран showLoading() — блокировал UI overlay в ряде сборок Padavan
-//   - next_page → возврат на ту же страницу (было "" → пустая страница)
-//   - action_script → Padavan вызовет /sbin/restart_udp2raw после Save
 function applyRule(){
     var sv = document.getElementById('srv_text').value;
     sv = sv.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
-    document.form.udp2raw_servers.value  = sv.replace(/\n/g, '>');
-    document.form.action_mode.value      = ' Apply ';
-    document.form.current_page.value     = 'Advanced_udp2raw.asp';
-    document.form.next_page.value        = 'Advanced_udp2raw.asp';
-    document.form.action_script.value    = 'restart_udp2raw';
+    document.form.udp2raw_servers.value = sv.replace(/\n/g, '>');
+    // udp2raw_enable_val уже правильно установлен через onEnableChange
+    document.form.action_mode.value   = ' Apply ';
+    document.form.current_page.value  = 'Advanced_udp2raw.asp';
+    document.form.next_page.value     = 'Advanced_udp2raw.asp';
+    document.form.action_script.value = 'restart_udp2raw';
     document.form.submit();
 }
 
 function done_validating(action){}
 </script>
-<style>
-.help-text  { color:#888; font-size:11px; margin-top:3px; }
-.status-box { background:#f5f5f5; border-radius:6px; padding:12px 16px; margin:10px; }
-</style>
 </head>
 <body onload="initial();" onunload="unload_body();">
 <div class="wrapper">
@@ -595,8 +635,17 @@ function done_validating(action){}
 <input type="hidden" name="action_mode"   value="">
 <input type="hidden" name="action_script" value="restart_udp2raw">
 <input type="hidden" name="flag"          value="">
-<input type="hidden" name="udp2raw_servers" value="">
-<input type="hidden" name="udp2raw_servers_h"
+
+<!-- FIX v7.0: HIDDEN INPUT вместо radio buttons.
+     Значение устанавливается JS через onEnableChange().
+     Гарантированно попадает в POST при любом submit. -->
+<input type="hidden" name="udp2raw_enable" id="udp2raw_enable_val"
+    value="<% nvram_get_x("", "udp2raw_enable"); %>">
+
+<!-- Серверы: пустой hidden для submit, _stored только для чтения -->
+<input type="hidden" name="udp2raw_servers" id="udp2raw_servers_submit" value="">
+<!-- Алиас для load_servers() -->
+<input type="hidden" id="udp2raw_servers_stored"
     value="<% nvram_get_x("", "udp2raw_servers"); %>">
 
 <div class="container-fluid"><div class="row-fluid">
@@ -628,23 +677,13 @@ function done_validating(action){}
           <tr>
             <th width="50%" style="border-top:0 none;">Включить udp2raw туннель</th>
             <td style="border-top:0 none;">
-              <div class="main_itoggle">
-                <div id="udp2raw_enable_on_of">
-                  <input type="checkbox" id="udp2raw_enable_fake"
-                    <% nvram_match_x("", "udp2raw_enable", "1", "value=1 checked"); %>
-                    <% nvram_match_x("", "udp2raw_enable", "0", "value=0"); %>>
-                </div>
-              </div>
-              <div style="position:absolute;margin-left:-10000px;">
-                <input type="radio" name="udp2raw_enable" id="udp2raw_enable_1"
-                    class="input" value="1"
-                    onclick="change_enabled();"
-                    <% nvram_match_x("", "udp2raw_enable", "1", "checked"); %>>Да
-                <input type="radio" name="udp2raw_enable" id="udp2raw_enable_0"
-                    class="input" value="0"
-                    onclick="change_enabled();"
-                    <% nvram_match_x("", "udp2raw_enable", "0", "checked"); %>>Нет
-              </div>
+              <!-- CSS TOGGLE v7.0: нет зависимости от itoggle/engage.itoggle -->
+              <label class="mil-switch">
+                <input type="checkbox" id="enable_cb"
+                    onchange="onEnableChange(this)">
+                <span class="mil-slider"></span>
+              </label>
+              <span id="toggle_lbl" class="mil-toggle-label"></span>
             </td>
           </tr>
         </table>
@@ -691,7 +730,7 @@ function done_validating(action){}
 </body>
 </html>
 ASPEOF
-echo "  Created Advanced_udp2raw.asp v6.0"
+echo "  Created Advanced_udp2raw.asp v7.0"
 
 ############################################################
 # 17. Patch state.js
@@ -713,70 +752,89 @@ else
 fi
 
 ############################################################
-# 18. nvram defaults
+# 18. nvram defaults — РАЗДЕЛЬНЫЕ шаги без break
 #
-# FIX v6.0: добавлены vpnc_cus3 defaults с tun-mtu 1300 mssfix 1260.
-# Из логов роутера: OpenVPN слал пакеты 1425 байт через udp2raw →
-# "huge packet warn" → нестабильное соединение.
-# vpnc_cus3 — nvram переменная для custom params в OpenVPN client WebUI.
-# После прошивки в разделе VPN Client → Custom Config будет стоять
-# tun-mtu 1300 / mssfix 1260 автоматически.
+# FIX v7.0: в v6.0 цикл имел break и выходил после первого
+# совпадения (defaults.c). variables.c никогда не патчился.
+# Теперь каждый файл патчится ОТДЕЛЬНЫМ шагом.
 ############################################################
 echo ">>> [11] nvram defaults"
-for F in \
-    "$TRUNK/user/shared/defaults.h" \
-    "$TRUNK/user/shared/defaults.c" \
-    "$TRUNK/user/rc/defaults.c" \
-    "$TRUNK/user/httpd/variables.c"; do
-    [ -f "$F" ] && grep -q 'router_defaults\|nvram_pair' "$F" || continue
 
-    # udp2raw vars
-    if ! grep -q "udp2raw_enable" "$F"; then
-        for TERM in '{ 0, 0 }' '{0, 0}'; do
-            if grep -q "$TERM" "$F"; then
-                LINE=$(grep -n "$TERM" "$F" | tail -1 | cut -d: -f1)
-                sed -i "${LINE}i\\
+patch_nvram_defaults() {
+    local FILE="$1"
+    local LABEL="$2"
+    [ -f "$FILE" ] || return
+    if grep -q "udp2raw_enable" "$FILE"; then
+        echo "  Already patched ($LABEL): $FILE"
+        return
+    fi
+    for TERM in '{ 0, 0 }' '{0, 0}'; do
+        if grep -q "$TERM" "$FILE"; then
+            LINE=$(grep -n "$TERM" "$FILE" | tail -1 | cut -d: -f1)
+            sed -i "${LINE}i\\
 \t{ \"udp2raw_enable\",  \"0\" },\\
 \t{ \"udp2raw_servers\", \"\" },\\
 \t{ \"udp2raw_status\",  \"\" },\\
-\t{ \"udp2raw_active\",  \"\" }," "$F"
-                echo "  Added udp2raw defaults to: $F"
-                break
-            fi
-        done
-    else
-        echo "  Already patched (udp2raw): $F"
-    fi
+\t{ \"udp2raw_active\",  \"\" }," "$FILE"
+            echo "  Patched ($LABEL): $FILE"
+            return
+        fi
+    done
+    echo "  WARN: terminator not found in $FILE"
+}
 
-    # FIX v6.0: OpenVPN MTU defaults (vpnc_cus3)
-    if ! grep -q "vpnc_cus3.*tun-mtu" "$F"; then
-        for TERM in '{ 0, 0 }' '{0, 0}'; do
-            if grep -q "$TERM" "$F"; then
-                LINE=$(grep -n "$TERM" "$F" | tail -1 | cut -d: -f1)
-                sed -i "${LINE}i\\
-\t{ \"vpnc_cus3\", \"tun-mtu 1300\\\\nmssfix 1260\" }," "$F"
-                echo "  Added vpnc_cus3 MTU defaults to: $F"
-                break
-            fi
-        done
-    else
-        echo "  vpnc_cus3 already patched: $F"
+patch_nvram_defaults "$TRUNK/user/shared/defaults.c"   "shared/defaults.c"
+
+# FIX v7.0: отдельно патчим variables.c — это whitelist Padavan httpd.
+# Из анализа build-лога: variables.c компилируется в httpd бинарник.
+# Padavan httpd сохраняет из POST формы ТОЛЬКО переменные из этого файла.
+# В v5.0 и v6.0 этот файл НЕ патчился → udp2raw_enable и udp2raw_servers
+# игнорировались httpd → toggle и серверы сбрасывались после Save.
+HTTPD_VARS="$TRUNK/user/httpd/variables.c"
+echo ">>> [12] httpd/variables.c patch (CRITICAL — whitelist для формы)"
+if [ -f "$HTTPD_VARS" ]; then
+    patch_nvram_defaults "$HTTPD_VARS" "httpd/variables.c"
+else
+    echo "  WARN: $HTTPD_VARS not found, trying alternative locations"
+    for ALT in \
+        "$TRUNK/user/httpd/nvram_vars.c" \
+        "$TRUNK/user/shared/nvram.c" \
+        "$TRUNK/user/rc/nvram_vars.c"; do
+        if [ -f "$ALT" ]; then
+            patch_nvram_defaults "$ALT" "$(basename $ALT)"
+            break
+        fi
+    done
+fi
+
+# MTU defaults
+echo ">>> [13] MTU defaults (vpnc_cus3)"
+for F in "$TRUNK/user/shared/defaults.c" "$TRUNK/user/httpd/variables.c"; do
+    [ -f "$F" ] || continue
+    if grep -q "vpnc_cus3.*tun-mtu" "$F"; then
+        echo "  vpnc_cus3 already in: $F"; continue
     fi
-    break
+    for TERM in '{ 0, 0 }' '{0, 0}'; do
+        if grep -q "$TERM" "$F"; then
+            LINE=$(grep -n "$TERM" "$F" | tail -1 | cut -d: -f1)
+            sed -i "${LINE}i\\
+\t{ \"vpnc_cus3\", \"tun-mtu 1300\\\\nmssfix 1260\" }," "$F"
+            echo "  Added vpnc_cus3 to: $F"
+            break
+        fi
+    done
 done
 
 ############################################################
 echo ""
 echo "============================================"
-echo "  MILLENIUM Group VPN — build ready v6.0"
+echo "  MILLENIUM Group VPN — build ready v7.0"
 echo ""
-echo "  Что исправлено vs v5.0:"
-echo "  - iptables: -I OUTPUT 1 + dedup (было -A)"
-echo "  - WebUI toggle+Save: теперь реально запускают VPN"
-echo "  - WebUI redirect: возврат на страницу после Save"
-echo "  - romfs: /sbin/restart_udp2raw (action_script hook)"
-echo "  - WAN hook: iptables RST при каждом поднятии WAN"
-echo "  - nvram: tun-mtu 1300 / mssfix 1260 по умолчанию"
+echo "  Root cause fixes:"
+echo "  1. variables.c патчится ОТДЕЛЬНО (не через break)"
+echo "     → httpd теперь сохраняет udp2raw_* переменные"
+echo "  2. CSS toggle + hidden input вместо itoggle/radio"
+echo "     → udp2raw_enable всегда правильный в POST"
 echo ""
 echo "  После прошивки — только 3 действия:"
 echo "  1. WebUI → MILLENIUM VPN → ввести серверы"
@@ -787,10 +845,14 @@ echo "============================================"
 
 echo ""
 echo "=== DIAGNOSTICS ==="
+echo "--- Files ---"
 ls -la "$UDP2RAW_DIR/files/" 2>/dev/null
-echo "--- /sbin/restart_udp2raw ---"
+echo "--- restart_udp2raw ---"
 cat "$ROMFS_SBIN/restart_udp2raw" 2>/dev/null || echo "NOT FOUND"
 echo "--- WAN hook ---"
 cat "$ROMFS_STORAGE/started_wan_hook.sh" 2>/dev/null || echo "NOT FOUND"
+echo "--- nvram vars in variables.c ---"
+grep "udp2raw_enable\|udp2raw_servers\|vpnc_cus3" \
+    "$TRUNK/user/httpd/variables.c" 2>/dev/null || echo "NOT FOUND"
 ls "$WWW/Advanced_udp2raw.asp" "$WWW/millenium_status.asp" 2>/dev/null && echo "ASP OK"
 echo "=== END ==="
