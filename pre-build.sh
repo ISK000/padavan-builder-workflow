@@ -1,23 +1,31 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v7.0
+# MILLENIUM Group — Padavan-NG pre-build v8.0
 #
-# Что исправлено в v7.0 (root cause analysis по логам билда):
+# ROOT CAUSE HISTORY:
+#  v5-v6: variables.c не патчился (break в цикле). httpd
+#         игнорировал udp2raw_* переменные — toggle сбрасывался.
+#  v7:    variables.c патчился НЕПРАВИЛЬНЫМ форматом:
+#         вставлялся { "name", "val" } (defaults.c формат),
+#         а variables.c ожидает { "name", int_flags } или
+#         { "ServiceId", "name", int_flags } — разные структуры.
+#         Кроме того, v7 НИКОГДА НЕ СОБИРАЛСЯ (CI гонял v6).
 #
-#  БАГИ v5.0/v6.0:
-#   1. variables.c НЕ патчился из-за break в цикле defaults.
-#      Padavan httpd хранит WHITELIST nvram-переменных в
-#      user/httpd/variables.c — переменных не в этом файле
-#      httpd просто игнорирует при сохранении формы.
-#      Результат: toggle и серверы сбрасываются после Save.
-#      ИСПРАВЛЕНИЕ: отдельный шаг патчинга variables.c.
+# ИСПРАВЛЕНО В v8.0:
 #
-#   2. itoggle не гарантирует синхронизацию radio buttons
-#      перед submit формы в некоторых версиях Padavan.
-#      Результат: udp2raw_enable = 0 в POST несмотря на
-#      визуальное положение toggle.
-#      ИСПРАВЛЕНИЕ: полностью заменить itoggle на CSS toggle
-#      с hidden input — не зависит от библиотек.
+#  1. restart_udp2raw получает enable+servers КАК АРГУМЕНТЫ
+#     через action_script поле формы. Скрипт сам сохраняет
+#     значения в nvram. variables.c whitelist БОЛЬШЕ НЕ БЛОКИРУЕТ.
+#     (Belt+suspenders: variables.c тоже патчится правильно)
+#
+#  2. Разделитель серверов '>' заменён на '%' — '>' в строке
+#     серверов интерпретировался shell как редирект при вызове
+#     через action_script.
+#
+#  3. variables.c патчится с АВТО-ДЕТЕКТОМ формата (2-field или
+#     3-field) по существующим записям в файле.
+#
+#  4. CSS toggle (без itoggle) — сохранён из v7.0.
 ############################################################
 set -euo pipefail
 
@@ -28,8 +36,8 @@ ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
 ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v7.0"
-echo "  Definitive fix: variables.c + CSS toggle"
+echo "  MILLENIUM Group VPN — pre-build v8.0"
+echo "  FIX: args-based save + % separator"
 echo "============================================"
 
 ############################################################
@@ -154,7 +162,8 @@ nvram set udp2raw_status="CONNECTING..."
 
 SKIP=$(cat /tmp/vpn_skip 2>/dev/null || echo "-1")
 OK=0
-echo "$SERVERS" | tr '>' '\n' > /tmp/vpn_srvlist
+# Разделитель % (не >, т.к. > интерпретируется shell как редирект)
+echo "$SERVERS" | tr '%' '\n' > /tmp/vpn_srvlist
 
 resolve_host() {
     local H="$1"
@@ -309,11 +318,46 @@ mkdir -p "$ROMFS_SBIN"
 
 cat > "$ROMFS_SBIN/restart_udp2raw" << 'RSTEOF'
 #!/bin/sh
-# Вызывается Padavan как action_script после сохранения WebUI формы.
-EN=$(nvram get udp2raw_enable 2>/dev/null)
+# Вызывается Padavan httpd как action_script после submit формы.
+# АРГУМЕНТЫ (передаются через action_script поле формы):
+#   $1 = enable  (0 или 1)
+#   $2 = servers (HOST:PORT:KEY разделённые %)
+#
+# v8.0 FIX: скрипт СОХРАНЯЕТ значения в nvram сам — не зависит
+# от variables.c whitelist. Также читает nvram как fallback.
+
+LOG="/tmp/udp2raw_restart.log"
+exec >> "$LOG" 2>&1
+echo "=== restart_udp2raw $(date) args=$* ==="
+
+# Принять аргументы от action_script или читать из nvram
+if [ $# -ge 1 ] && [ -n "$1" ]; then
+    EN="$1"
+else
+    EN=$(nvram get udp2raw_enable 2>/dev/null || echo 0)
+fi
+
+if [ $# -ge 2 ] && [ -n "$2" ]; then
+    SRVS="$2"
+else
+    SRVS=$(nvram get udp2raw_servers 2>/dev/null || echo "")
+fi
+
+[ -z "$EN" ]   && EN=0
+[ -z "$SRVS" ] && SRVS=""
+
+echo "  EN=$EN SRVS=$SRVS"
+
+# Сохранить в nvram (belt-and-suspenders)
+nvram set udp2raw_enable="$EN"   2>/dev/null
+nvram set udp2raw_servers="$SRVS" 2>/dev/null
+nvram commit 2>/dev/null
+
 if [ "$EN" = "1" ]; then
+    echo "  -> fl-vpn-start"
     /usr/bin/fl-vpn-start &
 else
+    echo "  -> fl-vpn-stop"
     /usr/bin/fl-vpn-stop
 fi
 RSTEOF
@@ -331,9 +375,9 @@ if [ -f "$WAN_HOOK" ]; then
     if ! grep -q "fl-vpn-watchdog" "$WAN_HOOK"; then
         cat >> "$WAN_HOOK" << 'HOOKEOF'
 
-# MILLENIUM VPN v7.0 — udp2raw autostart
+# MILLENIUM VPN v8.0 — udp2raw autostart
 sleep 3
-PRT=$(nvram get udp2raw_servers 2>/dev/null | cut -d'>' -f1 | cut -d: -f2)
+PRT=$(nvram get udp2raw_servers 2>/dev/null | cut -d'%' -f1 | cut -d: -f2)
 if [ -n "$PRT" ] && echo "$PRT" | grep -qE '^[0-9]+$'; then
     iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
     iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
@@ -347,10 +391,10 @@ HOOKEOF
 else
     cat > "$WAN_HOOK" << 'HOOKEOF'
 #!/bin/sh
-# MILLENIUM VPN v7.0 — udp2raw autostart
+# MILLENIUM VPN v8.0 — udp2raw autostart
 # Запускается автоматически при поднятии WAN.
 sleep 3
-PRT=$(nvram get udp2raw_servers 2>/dev/null | cut -d'>' -f1 | cut -d: -f2)
+PRT=$(nvram get udp2raw_servers 2>/dev/null | cut -d'%' -f1 | cut -d: -f2)
 if [ -n "$PRT" ] && echo "$PRT" | grep -qE '^[0-9]+$'; then
     iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
     iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
@@ -594,18 +638,24 @@ function change_enabled(){
 function load_servers(){
     var fld = document.getElementById('udp2raw_servers_stored');
     if (!fld) return;
-    document.getElementById('srv_text').value = fld.value.replace(/>/g, '\n');
+    document.getElementById('srv_text').value = fld.value.replace(/%/g, '\n');
 }
 
 function applyRule(){
     var sv = document.getElementById('srv_text').value;
     sv = sv.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
-    document.form.udp2raw_servers.value = sv.replace(/\n/g, '>');
-    // udp2raw_enable_val уже правильно установлен через onEnableChange
+    var srvPct = sv.replace(/\n/g, '%');
+    document.form.udp2raw_servers.value = srvPct;
+    var en = document.getElementById('udp2raw_enable_val').value;
     document.form.action_mode.value   = ' Apply ';
     document.form.current_page.value  = 'Advanced_udp2raw.asp';
     document.form.next_page.value     = 'Advanced_udp2raw.asp';
-    document.form.action_script.value = 'restart_udp2raw';
+    // v8.0 FIX: передаём enable и servers как аргументы action_script.
+    // restart_udp2raw сам сохранит в nvram — не зависит от variables.c.
+    // % как разделитель (> вызывал shell-redirect).
+    var scriptCmd = 'restart_udp2raw ' + en;
+    if (srvPct.length > 0) { scriptCmd += ' ' + srvPct; }
+    document.form.action_script.value = scriptCmd;
     document.form.submit();
 }
 
@@ -730,7 +780,7 @@ function done_validating(action){}
 </body>
 </html>
 ASPEOF
-echo "  Created Advanced_udp2raw.asp v7.0"
+echo "  Created Advanced_udp2raw.asp v8.0"
 
 ############################################################
 # 17. Patch state.js
@@ -752,11 +802,8 @@ else
 fi
 
 ############################################################
-# 18. nvram defaults — РАЗДЕЛЬНЫЕ шаги без break
-#
-# FIX v7.0: в v6.0 цикл имел break и выходил после первого
-# совпадения (defaults.c). variables.c никогда не патчился.
-# Теперь каждый файл патчится ОТДЕЛЬНЫМ шагом.
+############################################################
+# 18. nvram defaults (defaults.c)
 ############################################################
 echo ">>> [11] nvram defaults"
 
@@ -783,27 +830,80 @@ patch_nvram_defaults() {
     echo "  WARN: terminator not found in $FILE"
 }
 
-patch_nvram_defaults "$TRUNK/user/shared/defaults.c"   "shared/defaults.c"
+patch_nvram_defaults "$TRUNK/user/shared/defaults.c" "shared/defaults.c"
 
-# FIX v7.0: отдельно патчим variables.c — это whitelist Padavan httpd.
-# Из анализа build-лога: variables.c компилируется в httpd бинарник.
-# Padavan httpd сохраняет из POST формы ТОЛЬКО переменные из этого файла.
-# В v5.0 и v6.0 этот файл НЕ патчился → udp2raw_enable и udp2raw_servers
-# игнорировались httpd → toggle и серверы сбрасывались после Save.
-HTTPD_VARS="$TRUNK/user/httpd/variables.c"
-echo ">>> [12] httpd/variables.c patch (CRITICAL — whitelist для формы)"
-if [ -f "$HTTPD_VARS" ]; then
-    patch_nvram_defaults "$HTTPD_VARS" "httpd/variables.c"
-else
-    echo "  WARN: $HTTPD_VARS not found, trying alternative locations"
-    for ALT in \
-        "$TRUNK/user/httpd/nvram_vars.c" \
-        "$TRUNK/user/shared/nvram.c" \
-        "$TRUNK/user/rc/nvram_vars.c"; do
-        if [ -f "$ALT" ]; then
-            patch_nvram_defaults "$ALT" "$(basename $ALT)"
+############################################################
+# 12. variables.c — httpd whitelist (belt-and-suspenders)
+#
+# v8.0: авто-детект формата (2-field или 3-field).
+# Основной механизм сохранения — args в restart_udp2raw.
+# variables.c — дополнительный fallback для прямого httpd save.
+############################################################
+echo ">>> [12] httpd/variables.c patch (auto-detect format)"
+
+patch_httpd_vars() {
+    local FILE="$1"
+    [ -f "$FILE" ] || { echo "  SKIP: not found: $FILE"; return 1; }
+    if grep -q "udp2raw_enable" "$FILE"; then
+        echo "  Already patched: $FILE"; return 0
+    fi
+
+    # Определяем формат по количеству запятых в первой записи с nvram-переменной
+    # 2-field: { "var_name", flags }          — 1 запятая
+    # 3-field: { "ServiceId", "var_name", 0 } — 2 запятые
+    local SAMPLE
+    SAMPLE=$(grep -m1 '"[a-z_][a-z_0-9]\{2,\}"' "$FILE" 2>/dev/null)
+    local COMMAS=0
+    [ -n "$SAMPLE" ] && COMMAS=$(echo "$SAMPLE" | tr -cd ',' | wc -c)
+    echo "  Format detection: sample='$(echo $SAMPLE | head -c 60)' commas=$COMMAS"
+
+    # Найти точку вставки (перед sentinel)
+    local LINE=""
+    for TERM in '{ 0, 0 }' '{0, 0}' '{ NULL, 0 }' '{NULL, 0}' '{ 0, 0, 0 }'; do
+        if grep -q "$TERM" "$FILE"; then
+            LINE=$(grep -n "$TERM" "$FILE" | tail -1 | cut -d: -f1)
+            echo "  Sentinel '$TERM' at line $LINE"
             break
         fi
+    done
+
+    if [ -z "$LINE" ]; then
+        echo "  WARN: sentinel not found — appending before last };"
+        LINE=$(grep -n '};' "$FILE" | tail -1 | cut -d: -f1)
+        [ -z "$LINE" ] && { echo "  FAIL: no insertion point"; return 1; }
+    fi
+
+    if [ "$COMMAS" -ge 2 ]; then
+        # 3-field format — определяем serviceId из существующей записи
+        local SVC_ID
+        SVC_ID=$(echo "$SAMPLE" | grep -oE '"[A-Za-z][A-Za-z0-9_]+"' | head -1 | tr -d '"')
+        [ -z "$SVC_ID" ] && SVC_ID="LANHostConfig"
+        echo "  3-field format, serviceId='$SVC_ID'"
+        sed -i "${LINE}i\\
+\t{ \"${SVC_ID}\", \"udp2raw_enable\",  0 },\\
+\t{ \"${SVC_ID}\", \"udp2raw_servers\", 0 },\\
+\t{ \"${SVC_ID}\", \"udp2raw_status\",  0 },\\
+\t{ \"${SVC_ID}\", \"udp2raw_active\",  0 }," "$FILE"
+    else
+        echo "  2-field format"
+        sed -i "${LINE}i\\
+\t{ \"udp2raw_enable\",  0 },\\
+\t{ \"udp2raw_servers\", 0 },\\
+\t{ \"udp2raw_status\",  0 },\\
+\t{ \"udp2raw_active\",  0 }," "$FILE"
+    fi
+    echo "  Patched: $FILE"
+}
+
+HTTPD_VARS="$TRUNK/user/httpd/variables.c"
+if [ -f "$HTTPD_VARS" ]; then
+    patch_httpd_vars "$HTTPD_VARS"
+else
+    echo "  WARN: variables.c not found, trying alternatives"
+    for ALT in \
+        "$TRUNK/user/httpd/nvram_vars.c" \
+        "$TRUNK/user/shared/nvram.c"; do
+        [ -f "$ALT" ] && { patch_httpd_vars "$ALT"; break; }
     done
 fi
 
@@ -828,19 +928,23 @@ done
 ############################################################
 echo ""
 echo "============================================"
-echo "  MILLENIUM Group VPN — build ready v7.0"
+echo "  MILLENIUM Group VPN — build ready v8.0"
 echo ""
-echo "  Root cause fixes:"
-echo "  1. variables.c патчится ОТДЕЛЬНО (не через break)"
-echo "     → httpd теперь сохраняет udp2raw_* переменные"
-echo "  2. CSS toggle + hidden input вместо itoggle/radio"
-echo "     → udp2raw_enable всегда правильный в POST"
+echo "  ИСПРАВЛЕНИЯ v8.0:"
+echo "  1. restart_udp2raw принимает enable+servers КАК АРГУМЕНТЫ"
+echo "     → сохраняет в nvram сам → variables.c whitelist не нужен"
+echo "  2. Разделитель серверов > заменён на %"
+echo "     → > вызывал shell-redirect, сломав передачу серверов"
+echo "  3. variables.c: авто-детект формата (2-field/3-field)"
+echo "  4. CSS toggle сохранён (v7.0)"
 echo ""
-echo "  После прошивки — только 3 действия:"
-echo "  1. WebUI → MILLENIUM VPN → ввести серверы"
-echo "     → toggle ON → Сохранить и применить"
-echo "  2. VPN клиент → remote 127.0.0.1, порт 3333"
-echo "  3. Готово. Всё работает само."
+echo "  === ТЕСТ НЕМЕДЛЕННО (SSH на роутер) ==="
+echo "  nvram set udp2raw_enable=1"
+echo "  nvram set udp2raw_servers=89.39.70.159:4096:millenium2026"
+echo "  nvram commit"
+echo "  /sbin/restart_udp2raw 1 89.39.70.159:4096:millenium2026"
+echo "  cat /tmp/udp2raw_restart.log"
+echo "  cat /tmp/udp2raw.log"
 echo "============================================"
 
 echo ""
