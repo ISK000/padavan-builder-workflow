@@ -280,6 +280,13 @@ if ! pidof udp2raw >/dev/null 2>&1; then
     exit 0
 fi
 
+# Если udp2raw жив, но OpenVPN не запущен — перезапускаем туннель
+if ! pidof openvpn >/dev/null 2>&1; then
+    echo "$(date '+%H:%M') openvpn dead (udp2raw alive) -> restart" >> "$LOG"
+    fl-vpn-start >> "$LOG" 2>&1 &
+    exit 0
+fi
+
 for t in tun0 tun1 tun2; do
     ip link show "$t" 2>/dev/null | grep -q UP || continue
     GW=$(ip route show dev "$t" 2>/dev/null | awk '/via/{print $3}' | head -1)
@@ -385,7 +392,12 @@ if [ -n "$PRT" ] && echo "$PRT" | grep -qE '^[0-9]+$'; then
     iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
     iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
 fi
-sleep 2 && /usr/bin/fl-vpn-watchdog &
+EN=$(nvram get udp2raw_enable 2>/dev/null)
+if [ "$EN" = "1" ]; then
+    sleep 2 && /usr/bin/fl-vpn-start &
+else
+    sleep 2 && /usr/bin/fl-vpn-watchdog &
+fi
 HOOKEOF
         echo "  Appended to existing $WAN_HOOK"
     else
@@ -402,7 +414,13 @@ if [ -n "$PRT" ] && echo "$PRT" | grep -qE '^[0-9]+$'; then
     iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
     iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
 fi
-sleep 2 && /usr/bin/fl-vpn-watchdog &
+# Если включён — запускаем напрямую, не ждём cron watchdog
+EN=$(nvram get udp2raw_enable 2>/dev/null)
+if [ "$EN" = "1" ]; then
+    sleep 2 && /usr/bin/fl-vpn-start &
+else
+    sleep 2 && /usr/bin/fl-vpn-watchdog &
+fi
 HOOKEOF
     echo "  Created $WAN_HOOK"
 fi
