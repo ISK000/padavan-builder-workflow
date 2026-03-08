@@ -840,139 +840,16 @@ patch_nvram_defaults() {
 patch_nvram_defaults "$TRUNK/user/shared/defaults.c" "shared/defaults.c"
 
 ############################################################
-# 12. variables.c — httpd whitelist (belt-and-suspenders)
+# 12. variables.c — НЕ ПАТЧИМ (v8.0 финальное решение)
 #
-# v8.0: Python патч с точным определением формата.
-# Реальный формат padavan-ng: {"nvram_key", "default", FLAG1, FLAG2}
-# Основной механизм — args в restart_udp2raw. variables.c — fallback.
+# variables.c содержит НЕСКОЛЬКО разных массивов (variables[], events_desc[] и др.)
+# Автопатч вставлял в НЕПРАВИЛЬНЫЙ массив (events_desc) — build failure.
+# variables.c НЕ НУЖЕН: restart_udp2raw получает args напрямую и сам
+# вызывает nvram set. Whitelist httpd не участвует в нашем flow.
 ############################################################
-echo ">>> [12] httpd/variables.c patch (Python)"
-
+echo ">>> [12] variables.c — SKIP (not needed, args-based flow)"
 HTTPD_VARS="$TRUNK/user/httpd/variables.c"
-
-if [ ! -f "$HTTPD_VARS" ]; then
-    echo "  SKIP: variables.c not found"
-else
-
-python3 - "$HTTPD_VARS" << 'PYEOF'
-import re, sys
-
-FILE = sys.argv[1]
-NEW_VARS = ["udp2raw_enable", "udp2raw_servers", "udp2raw_status", "udp2raw_active"]
-NEW_DEFS = {"udp2raw_enable": "0", "udp2raw_servers": "", "udp2raw_status": "", "udp2raw_active": ""}
-
-with open(FILE, 'r') as f:
-    content = f.read()
-
-if 'udp2raw_enable' in content:
-    print("  Already patched:", FILE)
-    sys.exit(0)
-
-print("  Patching:", FILE)
-
-# --- Detect format ---
-# Match ANY entry starting with { "string", ...  }
-# This gives us indent + full body inside {}
-ENTRY_RE = re.compile(r'^([\t ]+)\{([ \t]*"[^"]*"[^}]*)\}', re.MULTILINE)
-entries = ENTRY_RE.findall(content)
-
-if not entries:
-    print("  ERROR: no entries found"); sys.exit(1)
-
-# Use first entry as format template
-sample_indent = entries[0][0]
-sample_body   = entries[0][1].strip()
-
-# Parse fields inside {}: split by comma but be careful about quoted strings
-# Simple approach: split by ',' outside quotes
-def split_fields(s):
-    fields, cur, in_q = [], '', False
-    for c in s:
-        if c == '"': in_q = not in_q
-        if c == ',' and not in_q:
-            fields.append(cur.strip()); cur = ''
-        else:
-            cur += c
-    if cur.strip(): fields.append(cur.strip())
-    return fields
-
-sample_fields = split_fields(sample_body)
-n_fields = len(sample_fields)
-print(f"  Sample: {repr(sample_body[:60])} -> {n_fields} fields")
-print(f"  Sample fields: {sample_fields}")
-
-# Determine extra (non-string) fields after first 2 string fields
-# e.g. for {"preferred_lang", "", NULL, FALSE}: extra = ['NULL', 'FALSE']
-# We copy these for our new entries
-string_field_count = sum(1 for f in sample_fields if f.startswith('"'))
-extra_fields = sample_fields[2:] if n_fields > 2 else []
-# Sanitize: only keep valid C literals
-safe_extras = [f if re.match(r'^(0|-?[0-9]+|NULL|FALSE|TRUE|[A-Z_]+)$', f) else '0'
-               for f in extra_fields]
-extra_str = (', ' + ', '.join(safe_extras)) if safe_extras else ''
-
-print(f"  Extra suffix: {repr(extra_str)}")
-
-def make_entry(varname, default):
-    return f'{sample_indent}{{"{varname}", "{default}"{extra_str}}}'
-
-new_lines = '\n'.join(make_entry(v, NEW_DEFS[v]) + ',' for v in NEW_VARS)
-new_block = new_lines + '\n'
-print(f"  New entries:\n{new_block}")
-
-# --- Find insertion point ---
-# Priority 1: find terminator {0, 0...} or {NULL, NULL...} or {NULL, NULL, 0, FALSE}
-TOK = r'(?:0|NULL|FALSE|TRUE|-?[0-9]+)'
-TERM_RE = re.compile(
-    r'([\t ]*\{[ \t]*' + TOK + r'[ \t]*(?:,[ \t]*' + TOK + r'[ \t]*)*\})',
-    re.MULTILINE
-)
-terms = list(TERM_RE.finditer(content))
-
-if terms:
-    last = terms[-1]
-    print(f"  Terminator found: {repr(last.group()[:60])}")
-    # Insert before terminator; ensure previous entry has trailing comma
-    before = content[:last.start()]
-    before_stripped = before.rstrip('\n\r\t ')
-    if before_stripped and not before_stripped.endswith(','):
-        before = before_stripped + ',\n'
-    content = before + new_block + content[last.start():]
-    with open(FILE, 'w') as f: f.write(content)
-    print("  SUCCESS via terminator")
-    sys.exit(0)
-
-# Priority 2: insert before closing }; of array
-# Use LAST standalone "};" line
-lines = content.split('\n')
-insert_at = None
-for i in range(len(lines) - 1, -1, -1):
-    if lines[i].strip() == '};':
-        insert_at = i
-        break
-
-if insert_at is None:
-    print("  ERROR: no }; found"); sys.exit(1)
-
-print(f"  Inserting before line {insert_at+1}: {repr(lines[insert_at])}")
-# Ensure line before insertion has trailing comma
-prev = insert_at - 1
-while prev >= 0 and lines[prev].strip() == '':
-    prev -= 1
-if prev >= 0 and not lines[prev].rstrip().endswith(','):
-    lines[prev] = lines[prev].rstrip() + ','
-    print(f"  Added trailing comma to line {prev+1}")
-
-lines[insert_at:insert_at] = new_lines.split('\n')
-with open(FILE, 'w') as f:
-    f.write('\n'.join(lines))
-print("  SUCCESS via }; fallback")
-PYEOF
-
-echo "  --- Verify ---"
-grep -n "udp2raw" "$HTTPD_VARS" && echo "  VERIFY OK" || echo "  VERIFY FAILED"
-
-fi
+[ -f "$HTTPD_VARS" ] && echo "  OK: exists $(wc -l < "$HTTPD_VARS") lines, not patching" || echo "  INFO: not found"
 
 # MTU defaults
 echo ">>> [13] MTU defaults (vpnc_cus3)"
