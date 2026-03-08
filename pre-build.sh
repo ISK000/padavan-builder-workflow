@@ -106,6 +106,8 @@ do_start() {
     iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
     iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
 
+    LOGLVL=$(nvram get udp2raw_loglevel 2>/dev/null)
+    [ -z "$LOGLVL" ] && LOGLVL=0
     /usr/bin/udp2raw -c \
         -l "127.0.0.1:3333" \
         -r "${SRV}:${PRT}" \
@@ -113,7 +115,7 @@ do_start() {
         --raw-mode faketcp \
         --cipher-mode xor \
         --auth-mode simple \
-        -a --log-level 3 > "$LOGFILE" 2>&1 &
+        -a --log-level "$LOGLVL" > "$LOGFILE" 2>&1 &
     echo $! > "$PIDFILE"
     sleep 2
     kill -0 "$(cat $PIDFILE)" 2>/dev/null && echo "OK PID=$(cat $PIDFILE)" || { echo "FAIL"; return 1; }
@@ -570,6 +572,7 @@ function initial(){
     load_body();
     load_servers();
     syncToggle();
+    syncLogLevel();
     update_status();
     var ld = document.getElementById('Loading');
     if (ld) ld.style.display = 'none';
@@ -663,6 +666,15 @@ function load_servers(){
     document.getElementById('srv_text').value = fld.value.replace(/%/g, '\n');
 }
 
+function syncLogLevel(){
+    var val = document.getElementById('udp2raw_loglevel_val').value || '0';
+    var sel = document.getElementById('udp2raw_loglevel_sel');
+    if (!sel) return;
+    for (var i = 0; i < sel.options.length; i++){
+        if (sel.options[i].value === val){ sel.selectedIndex = i; break; }
+    }
+}
+
 function applyRule(){
     var sv = document.getElementById('srv_text').value;
     sv = sv.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
@@ -724,6 +736,8 @@ function done_validating(action){}
 <!-- Алиас для load_servers() -->
 <input type="hidden" id="udp2raw_servers_stored"
     value="<% nvram_get_x("", "udp2raw_servers"); %>">
+<input type="hidden" name="udp2raw_loglevel" id="udp2raw_loglevel_val"
+    value="<% nvram_get_x("", "udp2raw_loglevel"); %>">
 
 <div class="container-fluid"><div class="row-fluid">
   <div class="span3">
@@ -779,6 +793,18 @@ function done_validating(action){}
                 При недоступности первого — автоматически переключается на следующий.<br>
                 Пароль — это ключ udp2raw (-k), не пароль OpenVPN.
               </div>
+            </td>
+          </tr>
+          <tr>
+            <th width="50%">Подробное логирование работы сервиса</th>
+            <td>
+              <select id="udp2raw_loglevel_sel" class="span4"
+                  onchange="document.getElementById('udp2raw_loglevel_val').value=this.value;">
+                <option value="0">Отключено</option>
+                <option value="3">Включено (уровень 3)</option>
+                <option value="5">Максимальное (уровень 5)</option>
+              </select>
+              <div class="help-text">Логи в /tmp/udp2raw.log</div>
             </td>
           </tr>
         </table>
@@ -846,10 +872,11 @@ patch_nvram_defaults() {
         if grep -q "$TERM" "$FILE"; then
             LINE=$(grep -n "$TERM" "$FILE" | tail -1 | cut -d: -f1)
             sed -i "${LINE}i\\
-\t{ \"udp2raw_enable\",  \"0\" },\\
-\t{ \"udp2raw_servers\", \"\" },\\
-\t{ \"udp2raw_status\",  \"\" },\\
-\t{ \"udp2raw_active\",  \"\" }," "$FILE"
+\t{ \"udp2raw_enable\",   \"0\" },\\
+\t{ \"udp2raw_servers\",  \"\" },\\
+\t{ \"udp2raw_status\",   \"\" },\\
+\t{ \"udp2raw_active\",   \"\" },\\
+\t{ \"udp2raw_loglevel\", \"0\" }," "$FILE"
             echo "  Patched ($LABEL): $FILE"
             return
         fi
@@ -889,8 +916,8 @@ python3 - "$HTTPD_VARS" << 'PYEOF'
 import re, sys
 
 FILE = sys.argv[1]
-NEW_VARS = ["udp2raw_enable", "udp2raw_servers", "udp2raw_status", "udp2raw_active"]
-NEW_DEFS = {"udp2raw_enable": "0", "udp2raw_servers": "", "udp2raw_status": "", "udp2raw_active": ""}
+NEW_VARS = ["udp2raw_enable", "udp2raw_servers", "udp2raw_status", "udp2raw_active", "udp2raw_loglevel"]
+NEW_DEFS = {"udp2raw_enable": "0", "udp2raw_servers": "", "udp2raw_status": "", "udp2raw_active": "", "udp2raw_loglevel": "0"}
 
 with open(FILE, 'r') as f:
     content = f.read()
