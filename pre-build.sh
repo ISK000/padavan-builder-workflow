@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v8.0
+# MILLENIUM Group — Padavan-NG pre-build v9.0
 #
 # ROOT CAUSE HISTORY:
 #  v5-v6: variables.c не патчился (break в цикле). httpd
@@ -36,8 +36,8 @@ ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
 ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v8.0"
-echo "  FIX: args-based save + % separator"
+echo "  MILLENIUM Group VPN — pre-build v9.0"
+echo "  FIX: action_script без аргументов, httpd сохраняет nvram"
 echo "============================================"
 
 ############################################################
@@ -668,20 +668,18 @@ function applyRule(){
     sv = sv.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
     var srvPct = sv.replace(/\n/g, '%');
     document.form.udp2raw_servers.value = srvPct;
-    var en = document.getElementById('udp2raw_enable_val').value;
-    document.form.action_mode.value   = ' Apply ';
-    document.form.current_page.value  = 'Advanced_udp2raw.asp';
-    document.form.next_page.value     = 'Advanced_udp2raw.asp';
-    // v8.0 FIX 1: передаём enable и servers как аргументы action_script.
-    // restart_udp2raw сам сохранит в nvram — не зависит от variables.c.
-    // % как разделитель (> вызывал shell-redirect).
-    var scriptCmd = 'restart_udp2raw ' + en;
-    if (srvPct.length > 0) { scriptCmd += ' ' + srvPct; }
-    document.form.action_script.value = scriptCmd;
+    document.form.action_mode.value  = ' Apply ';
+    document.form.current_page.value = 'Advanced_udp2raw.asp';
+    document.form.next_page.value    = 'Advanced_udp2raw.asp';
+    // v9.0 FIX: action_script = "restart_udp2raw" БЕЗ АРГУМЕНТОВ.
+    // httpd Padavan принимает только имя скрипта без пробелов/аргументов.
+    // Строка с аргументами ("restart_udp2raw 1 server...") молча игнорируется httpd.
+    // httpd сам сохраняет POST-поля в nvram через variables.c whitelist.
+    // restart_udp2raw читает enable и servers из nvram (fallback уже реализован).
+    document.form.action_script.value = 'restart_udp2raw';
 
-    // v8.0 FIX 2 (CRITICAL): ПЕРЕЗАГРУЖАЕМ СТРАНИЦУ после submit.
-    // Форма уходит в hidden_frame — без этого основное окно
-    // НИКОГДА не обновляется и toggle показывает старые значения!
+    // FIX (сохранён из v8): ПЕРЕЗАГРУЖАЕМ СТРАНИЦУ после submit.
+    // Форма уходит в hidden_frame — без этого основное окно не обновляется.
     var btn = document.getElementById('save_btn');
     if (btn) { btn.value = 'Сохранение...'; btn.disabled = true; }
     document.form.submit();
@@ -1020,21 +1018,12 @@ echo ""
 echo "============================================"
 echo "  MILLENIUM Group VPN — build ready v8.0"
 echo ""
-echo "  ИСПРАВЛЕНИЯ v8.0:"
-echo "  1. restart_udp2raw принимает enable+servers КАК АРГУМЕНТЫ"
-echo "     → сохраняет в nvram сам → variables.c whitelist не нужен"
-echo "  2. Разделитель серверов > заменён на %"
-echo "     → > вызывал shell-redirect, сломав передачу серверов"
-echo "  3. variables.c: авто-детект формата (2-field/3-field)"
-echo "  4. CSS toggle сохранён (v7.0)"
-echo ""
-echo "  === ТЕСТ НЕМЕДЛЕННО (SSH на роутер) ==="
-echo "  nvram set udp2raw_enable=1"
-echo "  nvram set udp2raw_servers=89.39.70.159:4096:millenium2026"
-echo "  nvram commit"
-echo "  /sbin/restart_udp2raw 1 89.39.70.159:4096:millenium2026"
-echo "  cat /tmp/udp2raw_restart.log"
-echo "  cat /tmp/udp2raw.log"
+echo "  ИСПРАВЛЕНИЕ v9.0:"
+echo "  action_script = 'restart_udp2raw' БЕЗ АРГУМЕНТОВ."
+echo "  httpd Padavan ИГНОРИРОВАЛ скрипт если в строке были пробелы."
+echo "  Теперь httpd сохраняет udp2raw_enable + udp2raw_servers"
+echo "  в nvram через variables.c whitelist, затем вызывает скрипт."
+echo "  restart_udp2raw читает enable+servers из nvram."
 echo "============================================"
 
 echo ""
