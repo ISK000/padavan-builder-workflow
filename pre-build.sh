@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v10.0
+# MILLENIUM Group — Padavan-NG pre-build v12.0
 #
 # ROOT CAUSE HISTORY:
 #  v5-v6: variables.c не патчился (break в цикле). httpd
@@ -36,7 +36,7 @@ ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
 ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v10.0"
+echo "  MILLENIUM Group VPN — pre-build v12.0"
 echo "  FIX: action_script без аргументов, httpd сохраняет nvram"
 echo "============================================"
 
@@ -676,6 +676,10 @@ function syncLogLevel(){
 }
 
 function applyRule(){
+    // v12.0 FIX 1: явно читаем checkbox — не полагаемся на onEnableChange()
+    var cb = document.getElementById('enable_cb');
+    document.getElementById('udp2raw_enable_val').value = cb.checked ? '1' : '0';
+
     var sv = document.getElementById('srv_text').value;
     sv = sv.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
     var srvPct = sv.replace(/\n/g, '%');
@@ -683,19 +687,28 @@ function applyRule(){
     document.form.action_mode.value  = ' Apply ';
     document.form.current_page.value = 'Advanced_udp2raw.asp';
     document.form.next_page.value    = 'Advanced_udp2raw.asp';
-    // v10.0 FIX: action_script = "restart_udp2raw" БЕЗ АРГУМЕНТОВ.
-    // httpd Padavan принимает только имя скрипта без пробелов/аргументов.
-    // Строка с аргументами ("restart_udp2raw 1 server...") молча игнорируется httpd.
-    // httpd сам сохраняет POST-поля в nvram через variables.c whitelist.
-    // restart_udp2raw читает enable и servers из nvram (fallback уже реализован).
-    document.form.action_script.value = 'restart_udp2raw';
+    document.form.action_script.value = '/sbin/restart_udp2raw';
 
-    // FIX (сохранён из v8): ПЕРЕЗАГРУЖАЕМ СТРАНИЦУ после submit.
-    // Форма уходит в hidden_frame — без этого основное окно не обновляется.
     var btn = document.getElementById('save_btn');
     if (btn) { btn.value = 'Сохранение...'; btn.disabled = true; }
     document.form.submit();
-    setTimeout(function(){ window.location.href = 'Advanced_udp2raw.asp'; }, 3500);
+
+    // v12.0 FIX 2: второй POST через 1.5с для гарантированного вызова action_script
+    // Не зависит от restart_needed_bits в variables.c вообще.
+    setTimeout(function(){
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/start_apply.htm', true);
+        xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+        xhr.send(
+            'action_mode=+Apply+' +
+            '&action_script=%2Fsbin%2Frestart_udp2raw' +
+            '&current_page=Advanced_udp2raw.asp' +
+            '&next_page=Advanced_udp2raw.asp' +
+            '&sid_list='
+        );
+    }, 1500);
+
+    setTimeout(function(){ window.location.href = 'Advanced_udp2raw.asp'; }, 4000);
 }
 
 function done_validating(action){}
@@ -719,10 +732,10 @@ function done_validating(action){}
 <input type="hidden" name="current_page"  value="Advanced_udp2raw.asp">
 <input type="hidden" name="next_page"     value="Advanced_udp2raw.asp">
 <input type="hidden" name="next_host"     value="">
-<input type="hidden" name="sid_list"      value="LANHostConfig;">
+<input type="hidden" name="sid_list"      value="">
 <input type="hidden" name="group_id"      value="">
 <input type="hidden" name="action_mode"   value="">
-<input type="hidden" name="action_script" value="restart_udp2raw">
+<input type="hidden" name="action_script" value="/sbin/restart_udp2raw">
 <input type="hidden" name="flag"          value="">
 
 <!-- FIX v7.0: HIDDEN INPUT вместо radio buttons.
@@ -990,28 +1003,48 @@ sample_fields = split_fields(sample_body)
 n_fields = len(sample_fields)
 print(f"  Sample: {repr(sample_body[:60])} -> {n_fields} fields")
 
-# Build extra suffix matching existing format
-extra_fields = sample_fields[2:] if n_fields > 2 else []
-safe_extras = [
-    f if re.match(r'^(0|-?[0-9]+|NULL|FALSE|TRUE|[A-Z_][A-Z0-9_]*)$', f) else '0'
-    for f in extra_fields
-]
-extra_str_sample = (', ' + ', '.join(safe_extras)) if safe_extras else ''
-print(f"  Sample extra suffix: {repr(extra_str_sample)}")
+# v12.0: УМНЫЙ ДЕТЕКТ ФОРМАТА variables.c
+# Padavan 3.4.x format:  {"ServiceID", "varname", validate_fn, flags}
+# Padavan old format:    {"varname", "default", validate_fn, flags}
+#
+# Ключевое отличие: если ОБА первых поля — quoted strings → 4-field с service_id
+def is_quoted(s): return s.startswith(\'"\') and s.endswith(\'"\')
 
-# v10.0 FIX: restart_needed_bits.
-# FALSE/0 = httpd не вызывает action_script. Нужно ненулевое значение.
-extra_str = extra_str_sample.replace('FALSE', '1')
-if extra_str == extra_str_sample and ', 0' in extra_str:
-    import re as _re2
-    extra_str = _re2.sub(r',\s*0(\s*[,}])', lambda m: ', 1' + m.group(1), extra_str, count=1)
-print(f"  Our restart suffix (restart=1): {repr(extra_str)}")
+if n_fields >= 2 and is_quoted(sample_fields[0]) and is_quoted(sample_fields[1]):
+    # 4-field format: {"ServiceID", "varname", validate_fn, flags}
+    # Нужно вставить: {"ServiceID", "udp2raw_enable", NULL, 1}
+    service_id = sample_fields[0].strip(\'"\')
+    print(f"  Detected 4-field format, ServiceID={repr(service_id)}")
 
-def make_entry(varname, default):
-    return f'{sample_indent}{{"{varname}", "{default}"{extra_str}}},'
+    def make_entry(varname, default):
+        # NULL validate, flags=1 чтобы httpd вызвал action_script
+        return f\'{sample_indent}{{"{service_id}", "{varname}", NULL, 1}},\'
 
-new_block = '\n'.join(make_entry(v, NEW_DEFS[v]) for v in NEW_VARS) + '\n'
-print(f"  New entries:\n{new_block}")
+else:
+    # 2-field format: {"varname", validate_fn, flags}  or {"varname", "default", fn, flags}
+    # Вставляем с flags=1
+    print(f"  Detected 2-field format")
+    # Определяем суффикс по образцу, заменяем последний флаг на 1
+    extra_fields = sample_fields[2:] if n_fields > 2 else []
+    safe_extras = [
+        f if re.match(r\'^(0|-?[0-9]+|NULL|FALSE|TRUE|[A-Z_][A-Z0-9_]*)$\', f) else \'NULL\'
+        for f in extra_fields
+    ]
+    # Устанавливаем restart flags = 1 (последнее числовое поле)
+    for i in range(len(safe_extras)-1, -1, -1):
+        if re.match(r\'^(0|[0-9]+|FALSE|TRUE)$\', safe_extras[i]):
+            safe_extras[i] = \'1\'
+            break
+    else:
+        safe_extras.append(\'1\')
+    extra_str = \', \' + \', \'.join(safe_extras) if safe_extras else \'\' 
+    print(f"  Extra suffix: {repr(extra_str)}")
+
+    def make_entry(varname, default):
+        return f\'{sample_indent}{{"{varname}", "{default}"{extra_str}}},'
+
+new_block = \'\\n\'.join(make_entry(v, NEW_DEFS[v]) for v in NEW_VARS) + \'\\n\'
+print(f"  New entries:\\n{new_block}")
 
 # 4. Insert just before arr_close, ensuring trailing comma on last existing entry
 before = content[:arr_close].rstrip('\n\r')
@@ -1053,7 +1086,7 @@ echo ""
 echo "============================================"
 echo "  MILLENIUM Group VPN — build ready v8.0"
 echo ""
-echo "  ИСПРАВЛЕНИЕ v10.0:"
+echo "  ИСПРАВЛЕНИЕ v12.0:"
 echo "  action_script = 'restart_udp2raw' БЕЗ АРГУМЕНТОВ."
 echo "  httpd Padavan ИГНОРИРОВАЛ скрипт если в строке были пробелы."
 echo "  Теперь httpd сохраняет udp2raw_enable + udp2raw_servers"
