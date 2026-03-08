@@ -362,7 +362,10 @@ else
 fi
 RSTEOF
 chmod +x "$ROMFS_SBIN/restart_udp2raw"
-echo "  Created $ROMFS_SBIN/restart_udp2raw"
+# Также копируем в files/ для установки через Makefile ROMFSINST
+cp "$ROMFS_SBIN/restart_udp2raw" "$UDP2RAW_DIR/files/restart_udp2raw"
+chmod +x "$UDP2RAW_DIR/files/restart_udp2raw"
+echo "  Created $ROMFS_SBIN/restart_udp2raw + files/restart_udp2raw"
 
 ############################################################
 # 11. WAN hook вшитый в romfs
@@ -444,7 +447,8 @@ romfs:
 	$(ROMFSINST) -p +x files/fl-vpn-stop      /usr/bin/fl-vpn-stop
 	$(ROMFSINST) -p +x files/fl-vpn-switch    /usr/bin/fl-vpn-switch
 	$(ROMFSINST) -p +x files/fl-vpn-watchdog  /usr/bin/fl-vpn-watchdog
-	$(ROMFSINST) -p +x files/fl-vpn-status    /usr/bin/fl-vpn-status
+	$(ROMFSINST) -p +x files/fl-vpn-status       /usr/bin/fl-vpn-status
+	$(ROMFSINST) -p +x files/restart_udp2raw     /sbin/restart_udp2raw
 	@echo "[udp2raw-tunnel] DONE"
 
 clean:
@@ -847,11 +851,135 @@ patch_nvram_defaults "$TRUNK/user/shared/defaults.c" "shared/defaults.c"
 # variables.c НЕ НУЖЕН: restart_udp2raw получает args напрямую и сам
 # вызывает nvram set. Whitelist httpd не участвует в нашем flow.
 ############################################################
-echo ">>> [12] variables.c — SKIP (not needed, args-based flow)"
-HTTPD_VARS="$TRUNK/user/httpd/variables.c"
-[ -f "$HTTPD_VARS" ] && echo "  OK: exists $(wc -l < "$HTTPD_VARS") lines, not patching" || echo "  INFO: not found"
+############################################################
+# 12. variables.c — httpd whitelist
+#
+# КРИТИЧНО для WebUI: Padavan httpd сохраняет POST-поля в nvram
+# ТОЛЬКО если они есть в variables.c. Без этого udp2raw_enable
+# никогда не сохраняется → toggle всегда сбрасывается в OFF.
+#
+# ИСПРАВЛЕНИЕ v8.1: Python с поиском КОНКРЕТНОГО массива
+# struct variable variables[] через отслеживание глубины скобок.
+# НЕ трогает events_desc[] или другие массивы в том же файле.
+############################################################
+echo ">>> [12] variables.c — struct-aware Python patch"
 
-# MTU defaults
+HTTPD_VARS="$TRUNK/user/httpd/variables.c"
+
+if [ ! -f "$HTTPD_VARS" ]; then
+    echo "  WARN: variables.c not found, skip"
+else
+python3 - "$HTTPD_VARS" << 'PYEOF'
+import re, sys
+
+FILE = sys.argv[1]
+NEW_VARS = ["udp2raw_enable", "udp2raw_servers", "udp2raw_status", "udp2raw_active"]
+NEW_DEFS = {"udp2raw_enable": "0", "udp2raw_servers": "", "udp2raw_status": "", "udp2raw_active": ""}
+
+with open(FILE, 'r') as f:
+    content = f.read()
+
+if 'udp2raw_enable' in content:
+    print("  Already patched:", FILE)
+    sys.exit(0)
+
+print("  Patching:", FILE)
+
+# 1. Find struct variable variables[] = { SPECIFICALLY
+m = re.search(r'struct\s+variable\s+\w+\s*\[\s*\]\s*=\s*\{', content)
+if not m:
+    print("  ERROR: 'struct variable ... [] = {' not found")
+    print("  Trying fallback: 'variables[] ='")
+    m = re.search(r'\bvariables\s*\[\s*\]\s*=\s*\{', content)
+    if not m:
+        print("  ERROR: no variables array found")
+        sys.exit(1)
+
+arr_open = m.end() - 1  # position of opening {
+print(f"  Array declaration: {repr(content[m.start():m.end()])}")
+print(f"  Opening brace at offset {arr_open}")
+
+# 2. Track brace depth to find EXACT closing brace of THIS array
+# This way we NEVER cross into events_desc[] or any other array
+depth = 0
+arr_close = None
+for i in range(arr_open, len(content)):
+    c = content[i]
+    if c == '{':
+        depth += 1
+    elif c == '}':
+        depth -= 1
+        if depth == 0:
+            arr_close = i
+            break
+
+if arr_close is None:
+    print("  ERROR: matching closing brace not found")
+    sys.exit(1)
+
+print(f"  Array: offset {arr_open} to {arr_close} ({arr_close - arr_open} chars)")
+
+# 3. Detect entry format from entries INSIDE this array ONLY
+arr_body = content[arr_open+1:arr_close]
+ENTRY_RE = re.compile(r'^([\t ]+)\{([ \t]*"[^"]*"[^}]*)\}', re.MULTILINE)
+entries = ENTRY_RE.findall(arr_body)
+
+if not entries:
+    print("  ERROR: no string-keyed entries found inside variables[] array")
+    print("  Array body (first 200):", repr(arr_body[:200]))
+    sys.exit(1)
+
+sample_indent = entries[0][0]
+sample_body   = entries[0][1].strip()
+
+def split_fields(s):
+    fields, cur, in_q = [], '', False
+    for c in s:
+        if c == '"': in_q = not in_q
+        if c == ',' and not in_q:
+            fields.append(cur.strip()); cur = ''
+        else:
+            cur += c
+    if cur.strip(): fields.append(cur.strip())
+    return fields
+
+sample_fields = split_fields(sample_body)
+n_fields = len(sample_fields)
+print(f"  Sample: {repr(sample_body[:60])} -> {n_fields} fields")
+
+# Build extra suffix matching existing format
+extra_fields = sample_fields[2:] if n_fields > 2 else []
+safe_extras = [
+    f if re.match(r'^(0|-?[0-9]+|NULL|FALSE|TRUE|[A-Z_][A-Z0-9_]*)$', f) else '0'
+    for f in extra_fields
+]
+extra_str = (', ' + ', '.join(safe_extras)) if safe_extras else ''
+print(f"  Extra suffix: {repr(extra_str)}")
+
+def make_entry(varname, default):
+    return f'{sample_indent}{{"{varname}", "{default}"{extra_str}}},'
+
+new_block = '\n'.join(make_entry(v, NEW_DEFS[v]) for v in NEW_VARS) + '\n'
+print(f"  New entries:\n{new_block}")
+
+# 4. Insert just before arr_close, ensuring trailing comma on last existing entry
+before = content[:arr_close].rstrip('\n\r')
+if before and not before.endswith(','):
+    before += ','
+    print("  Added trailing comma to last existing entry")
+
+new_content = before + '\n' + new_block + content[arr_close:]
+
+with open(FILE, 'w') as f:
+    f.write(new_content)
+
+print("  SUCCESS: variables.c patched (inside struct variable[] only)")
+PYEOF
+
+echo "  --- Verify ---"
+grep -n "udp2raw" "$HTTPD_VARS" && echo "  VERIFY OK" || echo "  VERIFY FAILED!"
+fi
+
 echo ">>> [13] MTU defaults (vpnc_cus3)"
 for F in "$TRUNK/user/shared/defaults.c" "$TRUNK/user/httpd/variables.c"; do
     [ -f "$F" ] || continue
