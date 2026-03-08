@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v9.0
+# MILLENIUM Group — Padavan-NG pre-build v10.0
 #
 # ROOT CAUSE HISTORY:
 #  v5-v6: variables.c не патчился (break в цикле). httpd
@@ -36,7 +36,7 @@ ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
 ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v9.0"
+echo "  MILLENIUM Group VPN — pre-build v10.0"
 echo "  FIX: action_script без аргументов, httpd сохраняет nvram"
 echo "============================================"
 
@@ -671,7 +671,7 @@ function applyRule(){
     document.form.action_mode.value  = ' Apply ';
     document.form.current_page.value = 'Advanced_udp2raw.asp';
     document.form.next_page.value    = 'Advanced_udp2raw.asp';
-    // v9.0 FIX: action_script = "restart_udp2raw" БЕЗ АРГУМЕНТОВ.
+    // v10.0 FIX: action_script = "restart_udp2raw" БЕЗ АРГУМЕНТОВ.
     // httpd Padavan принимает только имя скрипта без пробелов/аргументов.
     // Строка с аргументами ("restart_udp2raw 1 server...") молча игнорируется httpd.
     // httpd сам сохраняет POST-поля в nvram через variables.c whitelist.
@@ -969,8 +969,16 @@ safe_extras = [
     f if re.match(r'^(0|-?[0-9]+|NULL|FALSE|TRUE|[A-Z_][A-Z0-9_]*)$', f) else '0'
     for f in extra_fields
 ]
-extra_str = (', ' + ', '.join(safe_extras)) if safe_extras else ''
-print(f"  Extra suffix: {repr(extra_str)}")
+extra_str_sample = (', ' + ', '.join(safe_extras)) if safe_extras else ''
+print(f"  Sample extra suffix: {repr(extra_str_sample)}")
+
+# v10.0 FIX: restart_needed_bits.
+# FALSE/0 = httpd не вызывает action_script. Нужно ненулевое значение.
+extra_str = extra_str_sample.replace('FALSE', '1')
+if extra_str == extra_str_sample and ', 0' in extra_str:
+    import re as _re2
+    extra_str = _re2.sub(r',\s*0(\s*[,}])', lambda m: ', 1' + m.group(1), extra_str, count=1)
+print(f"  Our restart suffix (restart=1): {repr(extra_str)}")
 
 def make_entry(varname, default):
     return f'{sample_indent}{{"{varname}", "{default}"{extra_str}}},'
@@ -1018,7 +1026,7 @@ echo ""
 echo "============================================"
 echo "  MILLENIUM Group VPN — build ready v8.0"
 echo ""
-echo "  ИСПРАВЛЕНИЕ v9.0:"
+echo "  ИСПРАВЛЕНИЕ v10.0:"
 echo "  action_script = 'restart_udp2raw' БЕЗ АРГУМЕНТОВ."
 echo "  httpd Padavan ИГНОРИРОВАЛ скрипт если в строке были пробелы."
 echo "  Теперь httpd сохраняет udp2raw_enable + udp2raw_servers"
