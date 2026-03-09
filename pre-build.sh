@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v16.1
+# MILLENIUM Group — Padavan-NG pre-build v16.2
 #
-# FIXED in v16.1:
-# - SystemCmd now uses the REAL Padavan path:
-#   AJAX POST /apply.cgi with action_mode = " SystemCmd "
-# - no start_apply.htm for udp2raw
-# - no broken variables.c patch
-# - config saved to /etc/storage/udp2raw.conf
-# - short wrapper /usr/bin/u2s to avoid long command issues
+# v16.2:
+# - fixed duplicate fl-vpn-start launches
+# - removed nohup (not present on router)
+# - real SystemCmd via AJAX /apply.cgi
+# - lock files for restart/start
+# - config in /etc/storage/udp2raw.conf
+# - watchdog aware of active startup
 ############################################################
 set -euo pipefail
 
@@ -19,8 +19,8 @@ ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
 ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v16.1"
-echo "  FIX: real SystemCmd via AJAX /apply.cgi"
+echo "  MILLENIUM Group VPN — pre-build v16.2"
+echo "  FIX: lock files + real AJAX SystemCmd"
 echo "============================================"
 
 ############################################################
@@ -80,6 +80,8 @@ cat > "$UDP2RAW_DIR/files/udp2raw-common" << 'CMEOF'
 #!/bin/sh
 
 CFG="/etc/storage/udp2raw.conf"
+START_LOCK="/var/run/fl-vpn-start.pid"
+RESTART_LOCK="/var/run/restart_udp2raw.pid"
 
 cfg_load() {
     UDP2RAW_ENABLE=0
@@ -100,6 +102,24 @@ nvram_sync() {
     nvram set udp2raw_servers="${UDP2RAW_SERVERS:-}"
     nvram set udp2raw_loglevel="${UDP2RAW_LOGLEVEL:-0}"
     nvram commit
+}
+
+lock_is_running() {
+    PIDFILE="$1"
+    [ -f "$PIDFILE" ] || return 1
+    PID="$(cat "$PIDFILE" 2>/dev/null)"
+    [ -n "$PID" ] || return 1
+    kill -0 "$PID" 2>/dev/null
+}
+
+lock_take() {
+    PIDFILE="$1"
+    echo $$ > "$PIDFILE"
+}
+
+lock_release() {
+    PIDFILE="$1"
+    rm -f "$PIDFILE"
 }
 CMEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-common"
@@ -134,13 +154,13 @@ EOF
 chmod 600 "$TMP"
 mv "$TMP" "$CFG"
 
-# mirror to nvram for UI
 nvram set udp2raw_enable="$EN"
 nvram set udp2raw_servers="$SRVS"
 nvram set udp2raw_loglevel="$LOGLEVEL"
+nvram set udp2raw_status="DISCONNECTED"
+nvram set udp2raw_active=""
 nvram commit
 
-# ensure post_wan autostart exists
 touch "$POSTWAN"
 if ! grep -q "### UDP2RAW AUTO START ###" "$POSTWAN" 2>/dev/null; then
 cat >> "$POSTWAN" <<'EOF'
@@ -186,10 +206,10 @@ do_start_once() {
     [ -n "$PRT" ] || PRT=4096
     [ -n "$KEY" ] || KEY=changeme
 
-    killall udp2raw 2>/dev/null
-    sleep 1
+    killall udp2raw 2>/dev/null || true
+    sleep 2
 
-    iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
+    iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null || true
     iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
 
     /usr/bin/udp2raw -c \
@@ -202,7 +222,7 @@ do_start_once() {
         -a --log-level "${UDP2RAW_LOGLEVEL:-0}" > "$LOGFILE" 2>&1 &
 
     echo $! > "$PIDFILE"
-    sleep 2
+    sleep 3
 
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
         echo "OK PID=$(cat "$PIDFILE")"
@@ -215,7 +235,7 @@ do_start_once() {
 
 do_start() {
     do_start_once && return 0
-    sleep 2
+    sleep 3
     do_start_once && return 0
     return 1
 }
@@ -223,11 +243,11 @@ do_start() {
 do_stop() {
     if [ -f /tmp/udp2raw_srv ]; then
         . /tmp/udp2raw_srv
-        iptables -D OUTPUT -p tcp --dport "${PRT:-4096}" --tcp-flags RST RST -j DROP 2>/dev/null
+        iptables -D OUTPUT -p tcp --dport "${PRT:-4096}" --tcp-flags RST RST -j DROP 2>/dev/null || true
     fi
     [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null || true
     rm -f "$PIDFILE"
-    killall udp2raw 2>/dev/null
+    killall udp2raw 2>/dev/null || true
     echo "Stopped"
 }
 
@@ -252,6 +272,15 @@ cat > "$UDP2RAW_DIR/files/fl-vpn-start" << 'VPNEOF'
 . /usr/bin/udp2raw-common
 
 LOG="/tmp/fl-vpn.log"
+
+if lock_is_running "$START_LOCK"; then
+    echo "fl-vpn-start already running"
+    exit 0
+fi
+
+lock_take "$START_LOCK"
+trap 'lock_release "$START_LOCK"' EXIT INT TERM
+
 exec >> "$LOG" 2>&1
 echo "=== fl-vpn-start $(date) ==="
 
@@ -259,11 +288,18 @@ cfg_load
 nvram_sync
 
 SERVERS="$UDP2RAW_SERVERS"
-[ -n "$SERVERS" ] || { echo "No servers in config"; nvram set udp2raw_status="NO CONFIG"; nvram commit; exit 1; }
+[ -n "$SERVERS" ] || {
+    echo "No servers in config"
+    nvram set udp2raw_status="NO CONFIG"
+    nvram set udp2raw_active=""
+    nvram commit
+    exit 1
+}
 
 echo "$SERVERS" | tr '%' '\n' > /tmp/vpn_srvlist
-/usr/bin/fl-vpn-stop 2>/dev/null
+/usr/bin/fl-vpn-stop 2>/dev/null || true
 sleep 1
+
 nvram set udp2raw_status="CONNECTING..."
 nvram set udp2raw_active=""
 nvram commit
@@ -321,7 +357,6 @@ while IFS='' read -r line; do
     fi
 
     echo "  TUNNEL UP -> $S ($SIP):$P"
-    echo "$IDX" > /tmp/vpn_idx
     nvram set udp2raw_status="CONNECTED"
     nvram set udp2raw_active="$S:$P"
     nvram commit
@@ -346,7 +381,7 @@ if [ -f /tmp/udp2raw_srv ]; then
     . /tmp/udp2raw_srv
     ip route del "$SRV/32" 2>/dev/null || true
 fi
-/usr/bin/udp2raw-ctl stop 2>/dev/null
+/usr/bin/udp2raw-ctl stop 2>/dev/null || true
 nvram set udp2raw_status="DISCONNECTED"
 nvram set udp2raw_active=""
 nvram commit
@@ -355,8 +390,6 @@ chmod +x "$UDP2RAW_DIR/files/fl-vpn-stop"
 
 cat > "$UDP2RAW_DIR/files/fl-vpn-switch" << 'SWEOF'
 #!/bin/sh
-C=$(cat /tmp/vpn_idx 2>/dev/null || echo 0)
-echo "$C" > /tmp/vpn_skip
 /usr/bin/fl-vpn-stop
 sleep 1
 /usr/bin/fl-vpn-start &
@@ -384,6 +417,11 @@ loop() {
             continue
         fi
 
+        if lock_is_running "$START_LOCK"; then
+            sleep 5
+            continue
+        fi
+
         if ! pidof udp2raw >/dev/null 2>&1; then
             echo "$(date '+%H:%M:%S') udp2raw dead -> restart" >> "$LOG"
             /usr/bin/fl-vpn-start >> "$LOG" 2>&1
@@ -392,10 +430,7 @@ loop() {
         fi
 
         if ! pidof openvpn >/dev/null 2>&1; then
-            echo "$(date '+%H:%M:%S') openvpn dead -> restart" >> "$LOG"
-            /usr/bin/fl-vpn-start >> "$LOG" 2>&1
-            sleep 10
-            continue
+            echo "$(date '+%H:%M:%S') openvpn dead -> keep tunnel alive" >> "$LOG"
         fi
 
         sleep 20
@@ -451,7 +486,7 @@ printf "Server:       %s\n" "$(nvram get udp2raw_active 2>/dev/null || echo '-')
 printf "udp2raw:      %s\n" "$(pidof udp2raw >/dev/null && echo "ON ($(pidof udp2raw))" || echo OFF)"
 printf "openvpn:      %s\n" "$(pidof openvpn >/dev/null && echo "ON ($(pidof openvpn))" || echo OFF)"
 printf "watchdog:     %s\n" "$(/usr/bin/fl-vpn-watchdog status)"
-[ -f /tmp/udp2raw.log ] && echo "--- last udp2raw ---" && tail -5 /tmp/udp2raw.log
+[ -f /tmp/udp2raw.log ] && echo "--- last udp2raw ---" && tail -20 /tmp/udp2raw.log
 STEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-status"
 
@@ -468,8 +503,15 @@ cat > "$ROMFS_SBIN/restart_udp2raw" << 'RSTEOF'
 . /usr/bin/udp2raw-common
 
 LOG="/tmp/udp2raw_restart.log"
-exec >> "$LOG" 2>&1
 
+if lock_is_running "$RESTART_LOCK"; then
+    exit 0
+fi
+
+lock_take "$RESTART_LOCK"
+trap 'lock_release "$RESTART_LOCK"' EXIT INT TERM
+
+exec >> "$LOG" 2>&1
 echo "=== restart_udp2raw $(date) ==="
 
 cfg_load
@@ -505,7 +547,6 @@ UDP2RAW_SERVERS=""
 UDP2RAW_LOGLEVEL="0"
 CFGEOF
 chmod +x "$ROMFS_STORAGE/udp2raw.conf"
-
 echo "  Created udp2raw.conf"
 
 ############################################################
@@ -643,7 +684,7 @@ function update_status(){
         info.innerHTML = m_active ? 'Сервер: <b>' + m_active + '</b>' : '';
     } else if (s == 'CONNECTING...'){
         el.innerHTML = '<span class="label label-warning" style="font-size:14px;padding:5px 12px;">&#x25CF; Подключение...</span>';
-        info.innerHTML = '<i>Перебор серверов...</i>';
+        info.innerHTML = '<i>Запуск туннеля...</i>';
     } else {
         el.innerHTML = '<span class="label label-important" style="font-size:14px;padding:5px 12px;">&#x25CB; Туннель выкл.</span>';
         info.innerHTML = (s && s != 'DISCONNECTED') ? '<span style="color:#c00">' + s + '</span>' : '';
@@ -713,6 +754,10 @@ function applyRule(){
     }
     if (msg) msg.innerHTML = 'Выполнение команды...';
 
+    m_status = 'CONNECTING...';
+    m_active = '';
+    update_status();
+
     $j.post('/apply.cgi', {
         current_page: 'Advanced_udp2raw.asp',
         next_page: 'Advanced_udp2raw.asp',
@@ -729,6 +774,9 @@ function applyRule(){
         setTimeout(poll_status, 6000);
     }).fail(function(){
         if (msg) msg.innerHTML = 'Ошибка отправки команды';
+        m_status = 'DISCONNECTED';
+        m_active = '';
+        update_status();
     }).always(function(){
         if (btn){
             btn.value = 'Сохранить и применить';
@@ -772,8 +820,8 @@ function done_validating(action){}
         <div class="alert alert-info" style="margin:10px;">
           <b>Как работает:</b> OpenVPN &rarr; 127.0.0.1:3333 &rarr; udp2raw (faketcp) &rarr; сервер<br>
           DPI видит обычный TCP.<br><br>
-          <b>Важно:</b> эта версия использует штатный Padavan SystemCmd через AJAX /apply.cgi — так же, как консольная страница.<br>
-          После сохранения вызывается <b>u2s</b> &rarr; <b>restart_udp2raw</b>.<br><br>
+          <b>Важно:</b> эта версия использует штатный Padavan SystemCmd через AJAX /apply.cgi.<br>
+          Добавлена защита от двойного запуска и bind error.<br><br>
           <b>VPN клиент:</b> <a href="/vpncli.asp">Настройки</a>
           &rarr; Удалённый сервер: <b>127.0.0.1</b>, порт: <b>3333</b>, транспорт: <b>UDP</b>
         </div>
@@ -842,7 +890,7 @@ function done_validating(action){}
 </body>
 </html>
 ASPEOF
-echo "  Created Advanced_udp2raw.asp v16.1"
+echo "  Created Advanced_udp2raw.asp v16.2"
 
 ############################################################
 # 11. state.js menu
@@ -990,12 +1038,12 @@ fi
 ############################################################
 echo
 echo "============================================"
-echo "  MILLENIUM Group VPN — build ready v16.1"
+echo "  MILLENIUM Group VPN — build ready v16.2"
 echo
 echo "  MODE:"
-echo "  - WebUI uses real AJAX SystemCmd"
-echo "  - config in /etc/storage/udp2raw.conf"
-echo "  - short wrapper /usr/bin/u2s"
+echo "  - real AJAX SystemCmd"
+echo "  - no nohup dependency"
+echo "  - startup locks enabled"
 echo "============================================"
 
 echo
@@ -1005,5 +1053,5 @@ ls -la "$UDP2RAW_DIR/files/" 2>/dev/null
 echo "--- rc.c patch ---"
 grep -n "restart_udp2raw" "$TRUNK"/user/rc/*.c 2>/dev/null || echo "NOT FOUND in rc/*.c"
 echo "--- ASP ---"
-grep -n "SystemCmd\|u2s\|action_mode: ' SystemCmd '" "$WWW/Advanced_udp2raw.asp" 2>/dev/null || true
+grep -n "SystemCmd\|u2s\|CONNECTING" "$WWW/Advanced_udp2raw.asp" 2>/dev/null || true
 echo "=== END ==="
