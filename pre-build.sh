@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v15.1
+# MILLENIUM Group — Padavan-NG pre-build v15.2
 #
-# FIXES in v15.1:
-# 1) rc.c: register restart_udp2raw in rc daemon
-# 2) WebUI: reliable hidden-field submit for udp2raw_enable
-# 3) WebUI: reliable submit for udp2raw_servers via element id
-# 4) WAN hook: watchdog now always starts, even when EN=1
-# 5) restart_udp2raw: better logging
+# v15.2 SAFE MODE:
+# - WebUI only saves NVRAM
+# - NO action_script from Apply page
+# - watchdog always starts from WAN hook
+# - watchdog starts/stops udp2raw based on udp2raw_enable
+#
+# Reason:
+# direct custom action_script via start_apply.htm was causing
+# long apply hangs / admin disconnect / no logs.
 ############################################################
 set -euo pipefail
 
@@ -18,12 +21,12 @@ ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
 ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v15.1"
-echo "  FIX: rc.c + WebUI + watchdog"
+echo "  MILLENIUM Group VPN — pre-build v15.2"
+echo "  SAFE MODE: save-only WebUI + watchdog"
 echo "============================================"
 
 ############################################################
-# 1. OpenVPN 2.6.14 + XOR patch (scramble obfuscate)
+# 1. OpenVPN 2.6.14 + XOR patch
 ############################################################
 echo ">>> [1] OpenVPN XOR patch"
 OVPN_VER=2.6.14
@@ -57,7 +60,7 @@ done
 echo "  OK"
 
 ############################################################
-# 3. udp2raw binary (mipsel for MT7621 / R3Gv2)
+# 3. udp2raw binary
 ############################################################
 echo ">>> [3] udp2raw binary"
 mkdir -p "$UDP2RAW_DIR/files"
@@ -329,9 +332,9 @@ chmod +x "$UDP2RAW_DIR/files/fl-vpn-status"
 echo "  Scripts OK"
 
 ############################################################
-# 5. restart_udp2raw — rc service script
+# 5. restart_udp2raw — manual/service helper
 ############################################################
-echo ">>> [5] restart_udp2raw (rc service script)"
+echo ">>> [5] restart_udp2raw helper"
 mkdir -p "$ROMFS_SBIN"
 
 cat > "$ROMFS_SBIN/restart_udp2raw" << 'RSTEOF'
@@ -353,13 +356,12 @@ nvram commit 2>/dev/null
 if [ "$EN" = "1" ]; then
     echo "  -> fl-vpn-start"
     /usr/bin/fl-vpn-start &
-    sleep 1
-    /usr/bin/fl-vpn-watchdog >/dev/null 2>&1 &
 else
     echo "  -> fl-vpn-stop"
     /usr/bin/fl-vpn-stop
-    /usr/bin/fl-vpn-watchdog >/dev/null 2>&1 &
 fi
+
+/usr/bin/fl-vpn-watchdog >/dev/null 2>&1 &
 RSTEOF
 chmod +x "$ROMFS_SBIN/restart_udp2raw"
 cp "$ROMFS_SBIN/restart_udp2raw" "$UDP2RAW_DIR/files/restart_udp2raw"
@@ -375,7 +377,7 @@ mkdir -p "$ROMFS_STORAGE"
 WAN_HOOK="$ROMFS_STORAGE/started_wan_hook.sh"
 cat > "$WAN_HOOK" << 'HOOKEOF'
 #!/bin/sh
-# MILLENIUM VPN v15.1 — udp2raw autostart at WAN up
+# MILLENIUM VPN v15.2 — watchdog-first startup
 sleep 3
 
 PRT=$(nvram get udp2raw_servers 2>/dev/null | cut -d'%' -f1 | cut -d: -f2)
@@ -384,7 +386,6 @@ if [ -n "$PRT" ] && echo "$PRT" | grep -qE '^[0-9]+$'; then
     iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
 fi
 
-# ВАЖНО:
 # watchdog запускаем всегда, чтобы cron гарантированно установился
 /usr/bin/fl-vpn-watchdog >/dev/null 2>&1 &
 
@@ -584,8 +585,10 @@ function applyRule(){
     document.form.action_mode.value   = ' Apply ';
     document.form.current_page.value  = 'Advanced_udp2raw.asp';
     document.form.next_page.value     = 'Advanced_udp2raw.asp';
-    document.form.action_script.value = 'restart_udp2raw';
-    document.form.sid_list.value      = 'udp2raw_enable;udp2raw_servers;udp2raw_loglevel';
+
+    // SAFE MODE: ничего не вызываем напрямую
+    document.form.action_script.value = '';
+    document.form.sid_list.value      = '';
 
     var btn = document.getElementById('save_btn');
     if (btn){
@@ -619,7 +622,7 @@ function done_validating(action){}
 <input type="hidden" name="sid_list"      value="">
 <input type="hidden" name="group_id"      value="">
 <input type="hidden" name="action_mode"   value="">
-<input type="hidden" name="action_script" value="restart_udp2raw">
+<input type="hidden" name="action_script" value="">
 <input type="hidden" name="flag"          value="">
 <input type="hidden" name="udp2raw_enable" id="udp2raw_enable_val" value="<% nvram_get_x("", "udp2raw_enable"); %>">
 <input type="hidden" name="udp2raw_servers" id="udp2raw_servers_submit" value="">
@@ -642,7 +645,9 @@ function done_validating(action){}
 
         <div class="alert alert-info" style="margin:10px;">
           <b>Как работает:</b> OpenVPN &rarr; 127.0.0.1:3333 &rarr; udp2raw (faketcp) &rarr; сервер<br>
-          DPI видит обычный TCP. Туннель стартует автоматически при поднятии WAN.<br>
+          DPI видит обычный TCP.<br><br>
+          <b>Важно:</b> эта страница только сохраняет настройки. После сохранения запуск/остановка выполняется watchdog-ом автоматически.<br>
+          Обычно это происходит в течение ~1 минуты.<br><br>
           <b>VPN клиент:</b> <a href="/vpncli.asp">Настройки</a>
           &rarr; Удалённый сервер: <b>127.0.0.1</b>, порт: <b>3333</b>, транспорт: <b>UDP</b>
         </div>
@@ -693,7 +698,7 @@ function done_validating(action){}
           <tr>
             <td style="border:0 none;text-align:center;">
               <input type="button" id="save_btn" class="btn btn-primary" style="width:219px"
-                onclick="applyRule();" value="Сохранить и применить">
+                onclick="applyRule();" value="Сохранить настройки">
               <div class="help-text" style="text-align:center;margin-top:8px;">
                 Статус обновляется каждые 5 сек.
               </div>
@@ -711,7 +716,7 @@ function done_validating(action){}
 </body>
 </html>
 ASPEOF
-echo "  Created Advanced_udp2raw.asp v15.1"
+echo "  Created Advanced_udp2raw.asp v15.2"
 
 ############################################################
 # 11. state.js menu
@@ -733,7 +738,7 @@ else
 fi
 
 ############################################################
-# 12. nvram defaults (defaults.c)
+# 12. nvram defaults
 ############################################################
 echo ">>> [11] nvram defaults"
 patch_nvram_defaults() {
@@ -864,7 +869,7 @@ for F in "$TRUNK/user/shared/defaults.c"; do
 done
 
 ############################################################
-# 15. rc.c — register restart_udp2raw
+# 15. rc.c — keep helper registration for manual use
 ############################################################
 echo ">>> [14] ★ rc.c — add restart_udp2raw handler"
 
@@ -940,12 +945,12 @@ fi
 ############################################################
 echo
 echo "============================================"
-echo "  MILLENIUM Group VPN — build ready v15.1"
+echo "  MILLENIUM Group VPN — build ready v15.2"
 echo
-echo "  FIXES:"
-echo "  - rc.c registers restart_udp2raw"
-echo "  - WebUI submits enable flag reliably"
-echo "  - WAN hook always starts watchdog"
+echo "  MODE:"
+echo "  - WebUI saves only"
+echo "  - watchdog starts/stops tunnel"
+echo "  - no direct action_script from page"
 echo "============================================"
 
 echo
@@ -957,5 +962,5 @@ grep -n "restart_udp2raw" "$TRUNK"/user/rc/*.c 2>/dev/null || echo "NOT FOUND in
 echo "--- variables.c ---"
 grep -n "udp2raw_enable" "$TRUNK/user/httpd/variables.c" 2>/dev/null || echo "NOT FOUND"
 echo "--- ASP hidden fields ---"
-grep -n "udp2raw_enable_val\|udp2raw_servers_submit\|sid_list" "$WWW/Advanced_udp2raw.asp" 2>/dev/null || true
+grep -n "udp2raw_enable_val\|udp2raw_servers_submit\|action_script" "$WWW/Advanced_udp2raw.asp" 2>/dev/null || true
 echo "=== END ==="
