@@ -748,162 +748,220 @@ done
 ############################################################
 # 15. ★ КЛЮЧЕВОЙ ФИКС v15.0 ★
 #     Патч rc.c — регистрация restart_udp2raw как сервиса
-#
-#     httpd → notify_rc("restart_udp2raw") → rc демон
-#     rc ищет "restart_udp2raw" в handle_notifications()
-#     Без этой записи rc молча игнорирует вызов.
-#
-#     Вставляем рядом с restart_zapret (тот же паттерн).
 ############################################################
 echo ">>> [14] ★ rc.c — register restart_udp2raw service"
 
+# DEBUG: показать что содержит rc.c
+echo "  --- DEBUG: searching for service handlers in rc/*.c ---"
+for f in "$TRUNK"/user/rc/*.c; do
+    [ -f "$f" ] || continue
+    if grep -q "zapret" "$f" 2>/dev/null; then
+        echo "  ZAPRET found in: $f"
+        grep -n "zapret" "$f" 2>/dev/null | head -10
+    fi
+    # Показать любые restart_ обработчики
+    RESTART_COUNT=$(grep -c "restart_" "$f" 2>/dev/null || echo 0)
+    if [ "$RESTART_COUNT" -gt 5 ]; then
+        echo "  SERVICE HANDLERS in: $f ($RESTART_COUNT restart_ refs)"
+        grep -n "restart_" "$f" 2>/dev/null | tail -10
+    fi
+done
+
 cat > /tmp/patch_rc_udp2raw.py << 'RCPY'
-import sys, re
+import sys, re, os, glob
 
-# Ищем rc.c в нескольких возможных путях
-import glob
-candidates = glob.glob("padavan-ng/trunk/user/rc/rc.c") + \
-             glob.glob("padavan-ng/trunk/user/rc/services*.c") + \
-             glob.glob("padavan-ng/trunk/user/rc/notify*.c")
+# Step 1: Find ALL .c files with restart_ handlers
+rc_dir = "padavan-ng/trunk/user/rc"
+best_file = None
+best_count = 0
 
-# Ищем файл, в котором есть "restart_zapret"
-target = None
-for f in candidates:
+for fn in os.listdir(rc_dir):
+    if not fn.endswith('.c'):
+        continue
+    fp = os.path.join(rc_dir, fn)
     try:
-        with open(f) as fh:
-            if "restart_zapret" in fh.read():
-                target = f
-                break
+        with open(fp) as fh:
+            txt = fh.read()
+        count = txt.count('restart_')
+        if count > best_count:
+            best_count = count
+            best_file = fp
+        # Also check specifically for zapret
+        if 'zapret' in txt:
+            print(f"  zapret found in {fp}")
+            # Show lines
+            for i, line in enumerate(txt.split('\n')):
+                if 'zapret' in line:
+                    print(f"    {i+1}: {line.rstrip()}")
     except:
         pass
 
-if not target:
-    # Fallback: ищем рекурсивно
-    import os
-    for root, dirs, files in os.walk("padavan-ng/trunk/user/rc"):
-        for fn in files:
-            if fn.endswith('.c'):
-                fp = os.path.join(root, fn)
-                try:
-                    with open(fp) as fh:
-                        if "restart_zapret" in fh.read():
-                            target = fp
-                            break
-                except:
-                    pass
-        if target:
-            break
-
-if not target:
-    print("  ERROR: cannot find source file with restart_zapret handler")
+if not best_file:
+    print("  ERROR: no .c files with restart_ handlers found")
     sys.exit(1)
 
-print(f"  Found: {target}")
+print(f"  Best file: {best_file} ({best_count} restart_ refs)")
 
-with open(target) as f:
+with open(best_file) as f:
     content = f.read()
 
 if "restart_udp2raw" in content:
     print("  Already patched")
     sys.exit(0)
 
-# Ищем блок restart_zapret и вставляем restart_udp2raw после него
-# Паттерн 1: strcmp с entry->d_name (Padavan-NG стиль)
-# else if (strcmp(entry->d_name, "restart_zapret") == 0)
-# {
-#     ...
-# }
-p1 = re.search(
-    r'(else\s+if\s*\(\s*strcmp\s*\(\s*entry->d_name\s*,\s*"restart_zapret"\s*\)\s*==\s*0\s*\)\s*\{[^}]*\})',
-    content, re.DOTALL
-)
+lines = content.split('\n')
 
-# Паттерн 2: strcmp с script_name или просто строкой
-p2 = re.search(
-    r'(else\s+if\s*\(\s*strcmp\s*\([^,]*,\s*"restart_zapret"\s*\)\s*==\s*0\s*\)\s*\{[^}]*\})',
-    content, re.DOTALL
-)
+# Step 2: Find the notification handler - look for patterns
+# Pattern A: strcmp(something, "restart_xxx") == 0
+# Pattern B: macro-based handlers
+# Pattern C: function pointer tables
 
-# Паттерн 3: strstr вместо strcmp
-p3 = re.search(
-    r'(else\s+if\s*\(\s*strstr\s*\([^,]*,\s*"restart_zapret"\s*\)[^{]*\{[^}]*\})',
-    content, re.DOTALL
-)
+# Find ALL lines with restart_ in a strcmp/strncmp context
+handler_lines = []
+for i, line in enumerate(lines):
+    if 'restart_' in line and ('strcmp' in line or 'strncmp' in line or 'system(' in line):
+        handler_lines.append((i, line))
 
-match = p1 or p2 or p3
+print(f"  Handler lines found: {len(handler_lines)}")
+for num, line in handler_lines[-5:]:  # show last 5
+    print(f"    {num+1}: {line.rstrip()}")
 
-if not match:
-    # Паттерн 4: просто найти строку "restart_zapret" и ближайший закрывающий }
-    idx = content.find('"restart_zapret"')
-    if idx == -1:
-        print("  ERROR: restart_zapret string not found")
-        sys.exit(1)
-    # Найти закрывающую } этого блока
-    brace_count = 0
-    start = content.rfind('\n', 0, idx)  # начало строки
-    # Ищем начало блока (else if)
-    block_start = content.rfind('else', 0, idx)
-    if block_start == -1:
-        block_start = start
-    # Ищем конец блока
-    i = idx
+if handler_lines:
+    # Use the LAST handler line as anchor
+    last_handler_line = handler_lines[-1][0]
+    last_handler = handler_lines[-1][1]
+    print(f"  Using last handler at line {last_handler_line+1}")
+    
+    # Determine variable name from strcmp
+    varname = "entry->d_name"
+    var_m = re.search(r'str[n]?cmp\s*\(\s*([^,]+),', last_handler)
+    if var_m:
+        varname = var_m.group(1).strip()
+    print(f"  Variable: {varname}")
+    
+    # Find end of this handler's block (closing brace)
+    brace_depth = 0
     found_open = False
-    while i < len(content):
-        if content[i] == '{':
-            brace_count += 1
-            found_open = True
-        elif content[i] == '}':
-            brace_count -= 1
-            if found_open and brace_count == 0:
-                insert_pos = i + 1
+    end_line = last_handler_line
+    for j in range(last_handler_line, min(last_handler_line + 30, len(lines))):
+        for ch in lines[j]:
+            if ch == '{':
+                brace_depth += 1
+                found_open = True
+            elif ch == '}':
+                brace_depth -= 1
+                if found_open and brace_depth == 0:
+                    end_line = j
+                    break
+        if found_open and brace_depth == 0:
+            break
+    
+    print(f"  Block ends at line {end_line+1}: {lines[end_line].rstrip()}")
+    
+    # Detect indent
+    indent = '\t'
+    m = re.match(r'^(\s+)', last_handler)
+    if m:
+        indent = m.group(1)
+    
+    # Insert after end_line
+    new_lines = [
+        f'{indent}else if (strcmp({varname}, "restart_udp2raw") == 0)',
+        f'{indent}{{',
+        f'{indent}\tsystem("/sbin/restart_udp2raw");',
+        f'{indent}}}',
+    ]
+    
+    for idx, nl in enumerate(new_lines):
+        lines.insert(end_line + 1 + idx, nl)
+    
+else:
+    # Fallback: find ANY function that handles notifications
+    # Look for handle_notifications or notify pattern
+    print("  No strcmp handler lines found, trying fallback...")
+    
+    # Look for the function that contains most restart_ references
+    func_start = None
+    for i, line in enumerate(lines):
+        if 'restart_' in line:
+            # Walk backwards to find function definition
+            for j in range(i, max(0, i-50), -1):
+                if re.match(r'^(static\s+)?(void|int)\s+\w+\s*\(', lines[j]):
+                    func_start = j
+                    break
+            if func_start:
                 break
-        i += 1
-    else:
-        print("  ERROR: could not find block end")
+    
+    if not func_start:
+        print("  ERROR: cannot find any notification handler function")
+        # Last resort: dump first 20 lines with restart_
+        for i, line in enumerate(lines):
+            if 'restart_' in line:
+                print(f"    {i+1}: {line.rstrip()}")
+                if i > 20:
+                    break
         sys.exit(1)
-else:
-    insert_pos = match.end()
+    
+    print(f"  Found function at line {func_start+1}: {lines[func_start].rstrip()}")
+    
+    # Find the last closing brace of this function
+    # Find the last restart_ reference in this function
+    last_restart = func_start
+    brace_depth = 0
+    func_end = None
+    for j in range(func_start, len(lines)):
+        if 'restart_' in lines[j]:
+            last_restart = j
+        for ch in lines[j]:
+            if ch == '{': brace_depth += 1
+            elif ch == '}':
+                brace_depth -= 1
+                if brace_depth == 0:
+                    func_end = j
+                    break
+        if func_end:
+            break
+    
+    # Insert before function end, after last restart_ block
+    end_line = last_restart
+    # Find end of block after last_restart
+    bd = 0
+    fo = False
+    for j in range(last_restart, min(last_restart+20, len(lines))):
+        for ch in lines[j]:
+            if ch == '{': bd += 1; fo = True
+            elif ch == '}':
+                bd -= 1
+                if fo and bd == 0:
+                    end_line = j
+                    break
+        if fo and bd == 0:
+            break
+    
+    new_lines = [
+        '\telse if (strcmp(entry->d_name, "restart_udp2raw") == 0)',
+        '\t{',
+        '\t\tsystem("/sbin/restart_udp2raw");',
+        '\t}',
+    ]
+    
+    for idx, nl in enumerate(new_lines):
+        lines.insert(end_line + 1 + idx, nl)
 
-# Определяем формат (какая переменная используется в strcmp)
-if p1:
-    varname = "entry->d_name"
-elif p2:
-    # Извлекаем имя переменной из strcmp
-    m = re.search(r'strcmp\s*\(\s*([^,]+),', p2.group())
-    varname = m.group(1).strip() if m else "entry->d_name"
-elif p3:
-    m = re.search(r'strstr\s*\(\s*([^,]+),', p3.group())
-    varname = m.group(1).strip() if m else "entry->d_name"
-else:
-    varname = "entry->d_name"
+content = '\n'.join(lines)
 
-# Собираем новый блок
-new_block = f"""
-\telse if (strcmp({varname}, "restart_udp2raw") == 0)
-\t{{
-\t\tsystem("/sbin/restart_udp2raw");
-\t}}"""
-
-content = content[:insert_pos] + new_block + content[insert_pos:]
-
-with open(target, 'w') as f:
+with open(best_file, 'w') as f:
     f.write(content)
 
-print(f"  PATCHED: added restart_udp2raw handler after restart_zapret")
-print(f"  Variable: {varname}")
-
 # Verify
-with open(target) as f:
+with open(best_file) as f:
     v = f.read()
 if "restart_udp2raw" in v:
-    # Show context
-    lines = v.split('\n')
-    for i, line in enumerate(lines):
+    vlines = v.split('\n')
+    for i, line in enumerate(vlines):
         if 'restart_udp2raw' in line:
-            start = max(0, i-1)
-            end = min(len(lines), i+5)
-            for j in range(start, end):
-                print(f"  {j+1}: {lines[j]}")
+            for j in range(max(0,i-2), min(len(vlines),i+6)):
+                print(f"  {j+1}: {vlines[j]}")
             break
     print("  VERIFY OK")
 else:
