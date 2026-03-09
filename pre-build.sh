@@ -506,10 +506,13 @@ function applyRule(){
     var sv = document.getElementById('srv_text').value;
     sv = sv.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
     document.form.udp2raw_servers.value = sv.replace(/\n/g, '%');
+    document.getElementById('udp2raw_enable_val').value = document.getElementById('udp2raw_enable_sel').value;
+    document.getElementById('udp2raw_loglevel_val').value = document.getElementById('udp2raw_loglevel_sel').value;
     document.form.action_mode.value    = ' Apply ';
     document.form.current_page.value   = 'Advanced_udp2raw.asp';
     document.form.next_page.value      = 'Advanced_udp2raw.asp';
     document.form.action_script.value  = 'restart_udp2raw';
+    document.form.sid_list.value       = 'udp2raw_enable;udp2raw_servers;udp2raw_loglevel';
 
     var btn = document.getElementById('save_btn');
     if (btn) { btn.value = 'Сохранение...'; btn.disabled = true; }
@@ -541,7 +544,7 @@ function done_validating(action){}
 <input type="hidden" name="action_mode"   value="">
 <input type="hidden" name="action_script" value="restart_udp2raw">
 <input type="hidden" name="flag"          value="">
-<input type="hidden" id="udp2raw_enable_val" value="<% nvram_get_x("", "udp2raw_enable"); %>">
+<input type="hidden" name="udp2raw_enable" id="udp2raw_enable_val" value="<% nvram_get_x("", "udp2raw_enable"); %>">
 <input type="hidden" name="udp2raw_servers" id="udp2raw_servers_submit" value="">
 <input type="hidden" id="udp2raw_servers_stored" value="<% nvram_get_x("", "udp2raw_servers"); %>">
 <input type="hidden" name="udp2raw_loglevel" id="udp2raw_loglevel_val" value="<% nvram_get_x("", "udp2raw_loglevel"); %>">
@@ -575,7 +578,7 @@ function done_validating(action){}
           <tr>
             <th width="50%" style="border-top:0 none;">Включить udp2raw туннель</th>
             <td style="border-top:0 none;">
-              <select name="udp2raw_enable" id="udp2raw_enable_sel" class="span3" onchange="onEnableChange(this.value);">
+              <select id="udp2raw_enable_sel" class="span3" onchange="onEnableChange(this.value);">
                 <option value="0">OFF</option>
                 <option value="1">ON</option>
               </select>
