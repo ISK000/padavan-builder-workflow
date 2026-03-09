@@ -505,7 +505,7 @@ function syncLogLevel(){
 function applyRule(){
     var sv = document.getElementById('srv_text').value;
     sv = sv.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
-    document.form.udp2raw_servers.value = sv.replace(/\n/g, '%');
+    document.getElementById('udp2raw_servers_submit').value = sv.replace(/\n/g, '%');
     document.getElementById('udp2raw_enable_val').value = document.getElementById('udp2raw_enable_sel').value;
     document.getElementById('udp2raw_loglevel_val').value = document.getElementById('udp2raw_loglevel_sel').value;
     document.form.action_mode.value    = ' Apply ';
