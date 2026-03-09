@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v13.0
+# MILLENIUM Group — Padavan-NG pre-build v14.0
 #
 # ROOT CAUSE HISTORY:
 #  v5-v6: variables.c не патчился (break в цикле). httpd
@@ -36,7 +36,7 @@ ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
 ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v13.0"
+echo "  MILLENIUM Group VPN — pre-build v14.0"
 echo "  FIX: action_script без аргументов, httpd сохраняет nvram"
 echo "============================================"
 
@@ -590,7 +590,7 @@ function update_status(){
     }
 }
 
-// v13.0: SELECT-based enable (как у zapret)
+// v14.0: SELECT-based enable (как у zapret)
 function syncToggle(){
     var val = document.getElementById('udp2raw_enable_val').value || '0';
     var sel = document.getElementById('udp2raw_enable_sel');
@@ -625,7 +625,7 @@ function syncLogLevel(){
 }
 
 function applyRule(){
-    // v13.0: select name="udp2raw_enable" сохраняется автоматически в POST
+    // v14.0: select name="udp2raw_enable" сохраняется автоматически в POST
     var sv = document.getElementById('srv_text').value;
     sv = sv.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
     var srvPct = sv.replace(/\n/g, '%');
@@ -639,7 +639,7 @@ function applyRule(){
     if (btn) { btn.value = 'Сохранение...'; btn.disabled = true; }
     document.form.submit();
 
-    // v13.0 FIX 2: второй POST через 1.5с для гарантированного вызова action_script
+    // v14.0 FIX 2: второй POST через 1.5с для гарантированного вызова action_script
     // Не зависит от restart_needed_bits в variables.c вообще.
     setTimeout(function(){
         var xhr = new XMLHttpRequest();
@@ -684,7 +684,7 @@ function done_validating(action){}
 <input type="hidden" name="action_script" value="/sbin/restart_udp2raw">
 <input type="hidden" name="flag"          value="">
 
-<!-- v13.0: udp2raw_enable = select выше, id для JS -->
+<!-- v14.0: udp2raw_enable = select выше, id для JS -->
 <input type="hidden" id="udp2raw_enable_val"
     value="<% nvram_get_x("", "udp2raw_enable"); %>">
 
@@ -725,7 +725,7 @@ function done_validating(action){}
           <tr>
             <th width="50%" style="border-top:0 none;">Включить udp2raw туннель</th>
             <td style="border-top:0 none;">
-              <!-- v13.0: SELECT вместо CSS checkbox — гарантированно сохраняется в POST -->
+              <!-- v14.0: SELECT вместо CSS checkbox — гарантированно сохраняется в POST -->
               <select name="udp2raw_enable" id="udp2raw_enable_sel" class="span3"
                   onchange="onEnableChange(this.value);">
                 <option value="0">OFF</option>
@@ -868,19 +868,12 @@ HTTPD_VARS="$TRUNK/user/httpd/variables.c"
 if [ ! -f "$HTTPD_VARS" ]; then
     echo "  WARN: variables.c not found, skip"
 else
-    # v13.0 FIX: пишем Python в файл — нет проблем с экранированием кавычек
+    # v14.0 FIX: пишем Python в файл — нет проблем с экранированием кавычек
     cat > /tmp/patch_udp2raw_vars.py << 'PATCHPY'
 import re, sys
 
 FILE = sys.argv[1]
 NEW_VARS = ["udp2raw_enable", "udp2raw_servers", "udp2raw_status", "udp2raw_active", "udp2raw_loglevel"]
-NEW_DEFS = {
-    "udp2raw_enable":  "0",
-    "udp2raw_servers": "",
-    "udp2raw_status":  "",
-    "udp2raw_active":  "",
-    "udp2raw_loglevel":"0",
-}
 
 with open(FILE) as f:
     content = f.read()
@@ -900,14 +893,12 @@ if not m:
     sys.exit(1)
 
 arr_open = m.end() - 1
-print("  Array at offset:", arr_open)
 
-# Найти закрывающую скобку массива через подсчёт глубины
+# Найти закрывающую скобку массива
 depth = 0
 arr_close = None
 for i in range(arr_open, len(content)):
-    if content[i] == '{':
-        depth += 1
+    if content[i] == '{': depth += 1
     elif content[i] == '}':
         depth -= 1
         if depth == 0:
@@ -918,70 +909,36 @@ if arr_close is None:
     print("  ERROR: closing brace not found")
     sys.exit(1)
 
-# Определить формат записей внутри массива
+# Определить отступ из первой записи
 arr_body = content[arr_open+1:arr_close]
 ENTRY_RE = re.compile(r'^([\t ]+)\{([^}]+)\}', re.MULTILINE)
 entries = ENTRY_RE.findall(arr_body)
-
 if not entries:
-    print("  ERROR: no entries found in array")
+    print("  ERROR: no entries found")
     sys.exit(1)
+indent = entries[0][0]
 
-sample_indent = entries[0][0]
-sample_body   = entries[0][1].strip()
+# Новые записи: формат {"varname", "varname", NULL, 1}
+# 1 = ненулевые restart bits -> httpd вызовет action_script
+new_entries = ""
+for var in NEW_VARS:
+    new_entries += indent + '{"' + var + '", "' + var + '", NULL, 1},\n'
 
-# Разбить на поля (учитывать строки в кавычках)
-def split_fields(s):
-    fields, cur, in_q = [], '', False
-    for c in s:
-        if c == '"':
-            in_q = not in_q
-        if c == ',' and not in_q:
-            fields.append(cur.strip())
-            cur = ''
-        else:
-            cur += c
-    if cur.strip():
-        fields.append(cur.strip())
-    return fields
-
-fields = split_fields(sample_body)
-n = len(fields)
-print("  Fields:", n, "sample:", repr(sample_body[:60]))
-
-# v13 FIX: restart_needed_bits = 1 ВСЕГДА
-# Формат A (3+ полей, первое — строка в кавычках): {"varname", fn, flags}
-# Формат B (4+ полей, первые два — строки): {"ServiceID", "varname", fn, flags}
-def is_str(f):
-    return f.startswith('"') and f.endswith('"')
-
-if n >= 4 and is_str(fields[0]) and is_str(fields[1]):
-    # 4-field: {"ServiceID", "varname", validate_fn, flags}
-    svc = fields[0]
-    suffix = ", NULL, 1"
-    def make(var, dflt):
-        return sample_indent + '{"' + svc.strip('"') + '", "' + var + '"' + suffix + '},'
-    print("  Format: 4-field, ServiceID=" + svc)
-elif n >= 3 and is_str(fields[0]):
-    # 3-field: {"varname", validate_fn, flags}
-    suffix = ", NULL, 1"
-    def make(var, dflt):
-        return sample_indent + '{"' + var + '"' + suffix + '},'
-    print("  Format: 3-field")
+# FIX: вставить ПЕРЕД {NULL,...} терминатором (если есть)
+# Иначе httpd остановится на NULL и не увидит наши переменные
+null_m = re.search(r'(\{NULL\s*,)', content[arr_open:arr_close])
+if null_m:
+    insert_pos = arr_open + null_m.start()
+    print("  Inserting BEFORE NULL terminator at offset", insert_pos)
+    new_content = content[:insert_pos] + new_entries + content[insert_pos:]
 else:
-    # 2-field fallback: {"varname", "default"}
-    def make(var, dflt):
-        return sample_indent + '{"' + var + '", "' + dflt + '"},'
-    print("  Format: 2-field (fallback)")
+    # Нет терминатора — вставить перед закрывающей скобкой
+    print("  No NULL terminator, inserting before closing brace")
+    before = content[:arr_close].rstrip('\n\r')
+    if before and not before.endswith(','):
+        before += ','
+    new_content = before + "\n" + new_entries + content[arr_close:]
 
-new_entries = "\n".join(make(v, NEW_DEFS[v]) for v in NEW_VARS) + "\n"
-print("  New entries:\n" + new_entries)
-
-before = content[:arr_close].rstrip('\n\r')
-if before and not before.endswith(','):
-    before += ','
-
-new_content = before + "\n" + new_entries + content[arr_close:]
 with open(FILE, 'w') as f:
     f.write(new_content)
 
@@ -1013,9 +970,9 @@ done
 ############################################################
 echo ""
 echo "============================================"
-echo "  MILLENIUM Group VPN — build ready v13.0"
+echo "  MILLENIUM Group VPN — build ready v14.0"
 echo ""
-echo "  ИСПРАВЛЕНИЕ v13.0:"
+echo "  ИСПРАВЛЕНИЕ v14.0:"
 echo "  action_script = 'restart_udp2raw' БЕЗ АРГУМЕНТОВ."
 echo "  httpd Padavan ИГНОРИРОВАЛ скрипт если в строке были пробелы."
 echo "  Теперь httpd сохраняет udp2raw_enable + udp2raw_servers"
