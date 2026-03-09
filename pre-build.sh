@@ -749,184 +749,88 @@ done
 ############################################################
 ############################################################
 ############################################################
-# 15. ★ КЛЮЧЕВОЙ ФИКС v15.0 ★
-#     rc.c содержит ТАБЛИЦУ сервисов (не if/else цепочку).
-#     Каждый сервис: { "restart_xxx", script, nvram_var, ... }
-#     Нужно добавить строку в эту таблицу рядом с restart_zapret.
 ############################################################
-echo ">>> [14] ★ rc.c — add udp2raw to service table"
+# 15. ★ КЛЮЧЕВОЙ ФИКС v15.0 ★
+#     rc.c: вставляем обработчик restart_udp2raw
+#     после блока APP_ZAPRET (strcmp с RCN_RESTART_ZAPRET)
+############################################################
+echo ">>> [14] ★ rc.c — add restart_udp2raw handler"
 
-cat > /tmp/patch_rc_udp2raw.py << 'RCPY'
-import sys, re, os
+RC_FILE="$TRUNK/user/rc/rc.c"
 
-RC = "padavan-ng/trunk/user/rc/rc.c"
+if grep -q "restart_udp2raw" "$RC_FILE"; then
+    echo "  Already patched"
+else
+    # Находим #endif после APP_ZAPRET блока и вставляем наш блок после него
+    # Паттерн в rc.c:
+    #   #if defined(APP_ZAPRET)
+    #       else if (strcmp(entry->d_name, RCN_RESTART_ZAPRET) == 0)
+    #       { restart_zapret(); }
+    #   #endif
+    # Вставляем ПОСЛЕ этого #endif
 
-with open(RC) as f:
-    content = f.read()
-    lines = content.split('\n')
+    python3 -c "
+import re
+with open('$RC_FILE') as f:
+    lines = f.readlines()
 
-if "restart_udp2raw" in content:
-    print("  Already patched")
-    sys.exit(0)
-
-print(f"  rc.c: {len(lines)} lines")
-
-# Strategy: find the line containing "restart_zapret" (as a string literal)
-# This is in a table/array — we insert a similar entry after it
-
-zapret_line = None
+# Find APP_ZAPRET block
+zapret_start = None
 for i, line in enumerate(lines):
-    if '"restart_zapret"' in line:
-        zapret_line = i
-        print(f"  Found 'restart_zapret' at line {i+1}: {line.rstrip()}")
+    if 'APP_ZAPRET' in line and '#if' in line:
+        zapret_start = i
         break
 
-if zapret_line is None:
-    # Maybe it's defined via macro or concatenation
-    # Search for just zapret in context of a struct/array initialization
-    for i, line in enumerate(lines):
-        if 'zapret' in line and ('{' in line or '"' in line):
-            print(f"  zapret ref at {i+1}: {line.rstrip()}")
-            # Show context
-            for j in range(max(0,i-3), min(len(lines), i+5)):
-                print(f"    {j+1}: {lines[j].rstrip()}")
-            zapret_line = i
-            break
+if zapret_start is None:
+    print('  ERROR: APP_ZAPRET not found')
+    exit(1)
 
-if zapret_line is None:
-    # Last resort: search for zapret.sh
-    for i, line in enumerate(lines):
-        if 'zapret.sh' in line:
-            zapret_line = i
-            print(f"  Found zapret.sh at line {i+1}: {line.rstrip()}")
-            break
+# Find #endif after it
+endif_line = None
+for i in range(zapret_start+1, min(zapret_start+10, len(lines))):
+    if '#endif' in lines[i]:
+        endif_line = i
+        break
 
-if zapret_line is None:
-    print("  ERROR: cannot find zapret in rc.c at all")
-    # Dump all lines containing 'zapret'
-    for i, line in enumerate(lines):
-        if 'zapret' in line.lower():
-            print(f"    {i+1}: {line.rstrip()}")
-    sys.exit(1)
+if endif_line is None:
+    print('  ERROR: #endif not found after APP_ZAPRET')
+    exit(1)
 
-# Show surrounding context (10 lines before and after)
-print(f"  --- Context around line {zapret_line+1} ---")
-for j in range(max(0, zapret_line-10), min(len(lines), zapret_line+15)):
-    marker = " >>>" if j == zapret_line else "    "
-    print(f"  {marker} {j+1}: {lines[j].rstrip()}")
-print(f"  --- End context ---")
+print(f'  APP_ZAPRET at line {zapret_start+1}, #endif at line {endif_line+1}')
 
-# Determine the format of the table entry by analyzing the zapret line
-zline = lines[zapret_line]
+# Insert our block after #endif
+new_block = [
+    '\t\telse if (strcmp(entry->d_name, \"restart_udp2raw\") == 0)\n',
+    '\t\t{\n',
+    '\t\t\tsystem(\"/sbin/restart_udp2raw\");\n',
+    '\t\t}\n',
+]
 
-# Case 1: full entry on one line: { "restart_zapret", ... },
-if '{' in zline and 'restart_zapret' in zline:
-    # Copy the format, replace zapret with udp2raw
-    new_line = zline.replace('restart_zapret', 'restart_udp2raw')
-    new_line = new_line.replace('zapret.sh', 'restart_udp2raw')
-    new_line = new_line.replace('zapret_enable', 'udp2raw_enable')
-    new_line = new_line.replace('zapret', 'udp2raw')
-    
-    # But we need /sbin/restart_udp2raw as the script path
-    # Replace whatever script path is there
-    new_line = re.sub(r'"/usr/bin/[^"]*"', '"/sbin/restart_udp2raw"', new_line)
-    
-    lines.insert(zapret_line + 1, new_line)
-    print(f"  Inserted (case 1): {new_line.rstrip()}")
+for idx, nl in enumerate(new_block):
+    lines.insert(endif_line + 1 + idx, nl)
 
-# Case 2: entry spans multiple lines 
-elif '"restart_zapret"' in zline:
-    # Find the end of this entry (next line with }, or next entry with {)
-    entry_end = zapret_line
-    for j in range(zapret_line, min(zapret_line + 10, len(lines))):
-        if '}' in lines[j] and j >= zapret_line:
-            entry_end = j
-            break
-    
-    # Copy all lines of this entry
-    entry_lines = lines[zapret_line:entry_end+1]
-    new_entry = []
-    for el in entry_lines:
-        nl = el.replace('restart_zapret', 'restart_udp2raw')
-        nl = nl.replace('zapret.sh', 'restart_udp2raw')
-        nl = nl.replace('zapret_enable', 'udp2raw_enable')
-        nl = nl.replace('/usr/bin/zapret', '/sbin/restart_udp2raw')
-        nl = nl.replace('zapret', 'udp2raw')
-        new_entry.append(nl)
-    
-    for idx, nl in enumerate(new_entry):
-        lines.insert(entry_end + 1 + idx, nl)
-    print(f"  Inserted (case 2, {len(new_entry)} lines)")
-    for nl in new_entry:
-        print(f"    {nl.rstrip()}")
-
-# Case 3: zapret.sh found (not restart_zapret as literal)
-else:
-    # Get indent
-    indent = re.match(r'^(\s*)', zline).group(1)
-    
-    # Look at the surrounding structure to understand format
-    # Find the entry that contains this line
-    entry_start = zapret_line
-    for j in range(zapret_line, max(0, zapret_line-5), -1):
-        if '{' in lines[j]:
-            entry_start = j
-            break
-    entry_end = zapret_line
-    for j in range(zapret_line, min(zapret_line+5, len(lines))):
-        if '}' in lines[j]:
-            entry_end = j
-            break
-    
-    entry_lines = lines[entry_start:entry_end+1]
-    print(f"  Entry block ({entry_start+1}-{entry_end+1}):")
-    for el in entry_lines:
-        print(f"    {el.rstrip()}")
-    
-    # Clone and modify
-    new_entry = []
-    for el in entry_lines:
-        nl = el.replace('restart_zapret', 'restart_udp2raw')
-        nl = nl.replace('zapret.sh', 'restart_udp2raw')
-        nl = nl.replace('/usr/bin/zapret', '/sbin/restart_udp2raw')
-        nl = nl.replace('zapret_enable', 'udp2raw_enable')
-        nl = nl.replace('zapret', 'udp2raw')
-        new_entry.append(nl)
-    
-    for idx, nl in enumerate(new_entry):
-        lines.insert(entry_end + 1 + idx, nl)
-    print(f"  Inserted (case 3, {len(new_entry)} lines)")
-    for nl in new_entry:
-        print(f"    {nl.rstrip()}")
-
-# Write
-content = '\n'.join(lines)
-with open(RC, 'w') as f:
-    f.write(content)
+with open('$RC_FILE', 'w') as f:
+    f.writelines(lines)
 
 # Verify
-with open(RC) as f:
-    v = f.read()
-if "restart_udp2raw" in v:
-    vlines = v.split('\n')
-    for i, line in enumerate(vlines):
+with open('$RC_FILE') as f:
+    content = f.read()
+if 'restart_udp2raw' in content:
+    for i, line in enumerate(content.split('\n')):
         if 'restart_udp2raw' in line:
-            for j in range(max(0,i-2), min(len(vlines),i+5)):
-                print(f"  {j+1}: {vlines[j]}")
+            for j in range(max(0,i-3), min(len(content.split(chr(10))),i+6)):
+                print(f'  {j+1}: {content.split(chr(10))[j]}')
             break
-    print("  VERIFY OK")
+    print('  VERIFY OK')
 else:
-    print("  VERIFY FAILED!")
-    sys.exit(1)
-RCPY
-
-python3 /tmp/patch_rc_udp2raw.py
-RC_RESULT=$?
-
-if [ "$RC_RESULT" -ne 0 ]; then
-    echo "  *** CRITICAL: rc.c patch FAILED ***"
-    echo "  Without this patch, WebUI button will NOT work."
-    exit 1
+    print('  VERIFY FAILED')
+    exit(1)
+"
+    RC_RESULT=$?
+    if [ "$RC_RESULT" -ne 0 ]; then
+        echo "  *** CRITICAL: rc.c patch FAILED ***"
+        exit 1
+    fi
 fi
 
 ############################################################
