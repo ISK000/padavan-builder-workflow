@@ -1,19 +1,14 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v16.0
+# MILLENIUM Group — Padavan-NG pre-build v16.1
 #
-# v16.0:
-# - FIX WebUI save path:
-#   NO start_apply.htm for custom vars
-#   use /apply.cgi + SystemCmd -> /usr/bin/udp2raw-save
-#
-# - config is stored in:
-#   /etc/storage/udp2raw.conf
-#
-# - watchdog no longer depends on cru/crond
-#   uses background daemon with pidfile
-#
-# - nvram is used only as mirror for UI/status
+# FIXED in v16.1:
+# - SystemCmd now uses the REAL Padavan path:
+#   AJAX POST /apply.cgi with action_mode = " SystemCmd "
+# - no start_apply.htm for udp2raw
+# - no broken variables.c patch
+# - config saved to /etc/storage/udp2raw.conf
+# - short wrapper /usr/bin/u2s to avoid long command issues
 ############################################################
 set -euo pipefail
 
@@ -24,8 +19,8 @@ ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
 ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v16.0"
-echo "  FIX: direct save via apply.cgi + SystemCmd"
+echo "  MILLENIUM Group VPN — pre-build v16.1"
+echo "  FIX: real SystemCmd via AJAX /apply.cgi"
 echo "============================================"
 
 ############################################################
@@ -77,7 +72,7 @@ cd "$OLDPWD"
 echo "  OK: $(ls -lh "$UDP2RAW_DIR/files/udp2raw" | awk '{print $5}')"
 
 ############################################################
-# 4. Shell scripts
+# 4. Scripts
 ############################################################
 echo ">>> [4] Scripts"
 
@@ -112,6 +107,7 @@ chmod +x "$UDP2RAW_DIR/files/udp2raw-common"
 cat > "$UDP2RAW_DIR/files/udp2raw-save" << 'SAVEOF'
 #!/bin/sh
 CFG="/etc/storage/udp2raw.conf"
+POSTWAN="/etc/storage/post_wan_script.sh"
 TMP="/tmp/udp2raw.conf.tmp"
 
 EN="${1:-0}"
@@ -138,24 +134,53 @@ EOF
 chmod 600 "$TMP"
 mv "$TMP" "$CFG"
 
+# mirror to nvram for UI
 nvram set udp2raw_enable="$EN"
 nvram set udp2raw_servers="$SRVS"
 nvram set udp2raw_loglevel="$LOGLEVEL"
 nvram commit
 
-/sbin/mtd_storage.sh save >/dev/null 2>&1 || true
+# ensure post_wan autostart exists
+touch "$POSTWAN"
+if ! grep -q "### UDP2RAW AUTO START ###" "$POSTWAN" 2>/dev/null; then
+cat >> "$POSTWAN" <<'EOF'
 
+### UDP2RAW AUTO START ###
+if [ -f /etc/storage/udp2raw.conf ]; then
+    . /etc/storage/udp2raw.conf
+    /usr/bin/fl-vpn-watchdog start >/dev/null 2>&1 || true
+    if [ "${UDP2RAW_ENABLE:-0}" = "1" ]; then
+        /sbin/restart_udp2raw >/dev/null 2>&1 &
+    fi
+fi
+### UDP2RAW AUTO END ###
+EOF
+chmod +x "$POSTWAN"
+fi
+
+/sbin/mtd_storage.sh save >/dev/null 2>&1 || true
 /sbin/restart_udp2raw >/dev/null 2>&1 &
+
 echo "OK"
 SAVEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-save"
 
+cat > "$UDP2RAW_DIR/files/u2s" << 'U2SEOF'
+#!/bin/sh
+exec /usr/bin/udp2raw-save "$@"
+U2SEOF
+chmod +x "$UDP2RAW_DIR/files/u2s"
+
 cat > "$UDP2RAW_DIR/files/udp2raw-ctl" << 'CTLEOF'
 #!/bin/sh
+. /usr/bin/udp2raw-common
+
 PIDFILE="/var/run/udp2raw.pid"
 LOGFILE="/tmp/udp2raw.log"
 
-do_start() {
+do_start_once() {
+    cfg_load
+
     [ -f /tmp/udp2raw_srv ] && . /tmp/udp2raw_srv || { echo "No server config"; return 1; }
     [ -n "$SRV" ] || { echo "SRV empty"; return 1; }
     [ -n "$PRT" ] || PRT=4096
@@ -167,9 +192,6 @@ do_start() {
     iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
     iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
 
-    LOGLVL="${UDP2RAW_LOGLEVEL:-0}"
-    [ -n "$LOGLVL" ] || LOGLVL=0
-
     /usr/bin/udp2raw -c \
         -l "127.0.0.1:3333" \
         -r "${SRV}:${PRT}" \
@@ -177,7 +199,7 @@ do_start() {
         --raw-mode faketcp \
         --cipher-mode xor \
         --auth-mode simple \
-        -a --log-level "$LOGLVL" > "$LOGFILE" 2>&1 &
+        -a --log-level "${UDP2RAW_LOGLEVEL:-0}" > "$LOGFILE" 2>&1 &
 
     echo $! > "$PIDFILE"
     sleep 2
@@ -188,6 +210,13 @@ do_start() {
     fi
 
     echo "FAIL"
+    return 1
+}
+
+do_start() {
+    do_start_once && return 0
+    sleep 2
+    do_start_once && return 0
     return 1
 }
 
@@ -239,9 +268,6 @@ nvram set udp2raw_status="CONNECTING..."
 nvram set udp2raw_active=""
 nvram commit
 
-SKIP=$(cat /tmp/vpn_skip 2>/dev/null || echo "-1")
-OK=0
-
 resolve_host() {
     H="$1"
     echo "$H" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && { echo "$H"; return; }
@@ -253,6 +279,7 @@ resolve_host() {
     [ -n "$IP" ] && echo "$IP"
 }
 
+OK=0
 IDX=0
 while IFS='' read -r line; do
     [ -n "$line" ] || continue
@@ -266,14 +293,9 @@ while IFS='' read -r line; do
     [ -n "$P" ] || P=4096
     [ -n "$K" ] || K=changeme
 
-    if [ "$IDX" -le "$SKIP" ] && [ "$SKIP" -ge 0 ]; then
-        IDX=$((IDX+1))
-        continue
-    fi
-
     echo ">>> [$IDX] $S:$P"
-    SIP=$(resolve_host "$S")
 
+    SIP=$(resolve_host "$S")
     if [ -z "$SIP" ]; then
         echo "  DNS fail: $S"
         IDX=$((IDX+1))
@@ -281,12 +303,6 @@ while IFS='' read -r line; do
     fi
 
     [ "$SIP" = "$S" ] || echo "  resolved: $S -> $SIP"
-
-    ping -c2 -W4 "$SIP" >/dev/null 2>&1 || {
-        echo "  unreachable: $SIP"
-        IDX=$((IDX+1))
-        continue
-    }
 
     printf "SRV=%s\nPRT=%s\nKEY=%s\n" "$SIP" "$P" "$K" > /tmp/udp2raw_srv
 
@@ -313,12 +329,6 @@ while IFS='' read -r line; do
     OK=1
     break
 done < /tmp/vpn_srvlist
-
-if [ "$OK" != "1" ] && [ "$SKIP" -ge 0 ]; then
-    echo "Retry from 0"
-    echo "-1" > /tmp/vpn_skip
-    exec /usr/bin/fl-vpn-start
-fi
 
 if [ "$OK" != "1" ]; then
     nvram set udp2raw_status="ALL FAILED"
@@ -388,17 +398,6 @@ loop() {
             continue
         fi
 
-        for t in tun0 tun1 tun2; do
-            ip link show "$t" 2>/dev/null | grep -q UP || continue
-            GW=$(ip route show dev "$t" 2>/dev/null | awk '/via/{print $3}' | head -1)
-            [ -n "$GW" ] || GW="10.8.0.1"
-            ping -c2 -W5 -I "$t" "$GW" >/dev/null 2>&1 || {
-                echo "$(date '+%H:%M:%S') VPN dead via $t -> switch" >> "$LOG"
-                /usr/bin/fl-vpn-switch >> "$LOG" 2>&1
-            }
-            break
-        done
-
         sleep 20
     done
 }
@@ -459,7 +458,7 @@ chmod +x "$UDP2RAW_DIR/files/fl-vpn-status"
 echo "  Scripts OK"
 
 ############################################################
-# 5. restart_udp2raw
+# 5. restart_udp2raw helper
 ############################################################
 echo ">>> [5] restart_udp2raw helper"
 mkdir -p "$ROMFS_SBIN"
@@ -494,9 +493,9 @@ chmod +x "$UDP2RAW_DIR/files/restart_udp2raw"
 echo "  Created restart_udp2raw"
 
 ############################################################
-# 6. default config + WAN hook
+# 6. default storage files
 ############################################################
-echo ">>> [6] default config + WAN hook"
+echo ">>> [6] default storage files"
 mkdir -p "$ROMFS_STORAGE"
 
 cat > "$ROMFS_STORAGE/udp2raw.conf" << 'CFGEOF'
@@ -507,31 +506,7 @@ UDP2RAW_LOGLEVEL="0"
 CFGEOF
 chmod +x "$ROMFS_STORAGE/udp2raw.conf"
 
-WAN_HOOK="$ROMFS_STORAGE/started_wan_hook.sh"
-cat > "$WAN_HOOK" << 'HOOKEOF'
-#!/bin/sh
-sleep 3
-
-/usr/bin/fl-vpn-watchdog start >/dev/null 2>&1 || true
-
-CFG="/etc/storage/udp2raw.conf"
-if [ -f "$CFG" ]; then
-    . "$CFG"
-fi
-
-PRT=$(printf '%s' "${UDP2RAW_SERVERS:-}" | cut -d'%' -f1 | cut -d: -f2)
-if [ -n "$PRT" ] && echo "$PRT" | grep -qE '^[0-9]+$'; then
-    iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
-    iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
-fi
-
-if [ "${UDP2RAW_ENABLE:-0}" = "1" ]; then
-    sleep 2
-    /usr/bin/fl-vpn-start &
-fi
-HOOKEOF
-chmod +x "$WAN_HOOK"
-echo "  Created $WAN_HOOK"
+echo "  Created udp2raw.conf"
 
 ############################################################
 # 7. custom-extras
@@ -567,6 +542,7 @@ romfs:
 	$(ROMFSINST) -p +x files/udp2raw           /usr/bin/udp2raw
 	$(ROMFSINST) -p +x files/udp2raw-common    /usr/bin/udp2raw-common
 	$(ROMFSINST) -p +x files/udp2raw-save      /usr/bin/udp2raw-save
+	$(ROMFSINST) -p +x files/u2s               /usr/bin/u2s
 	$(ROMFSINST) -p +x files/udp2raw-ctl       /usr/bin/udp2raw-ctl
 	$(ROMFSINST) -p +x files/fl-vpn-start      /usr/bin/fl-vpn-start
 	$(ROMFSINST) -p +x files/fl-vpn-stop       /usr/bin/fl-vpn-stop
@@ -581,7 +557,7 @@ clean:
 MKEOF
 
 ############################################################
-# 10. ASP + status endpoint
+# 10. WebUI ASP
 ############################################################
 echo ">>> [9] WebUI ASP"
 
@@ -719,28 +695,46 @@ function applyRule(){
     var sv = document.getElementById('srv_text').value;
     sv = sv.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
 
-    var en  = document.getElementById('udp2raw_enable_sel').value;
-    var ll  = document.getElementById('udp2raw_loglevel_sel').value;
+    var en = document.getElementById('udp2raw_enable_sel').value;
+    var ll = document.getElementById('udp2raw_loglevel_sel').value;
+    var compact = sv.replace(/\n/g, '%');
 
-    document.getElementById('udp2raw_enable_val').value = en;
-    document.getElementById('udp2raw_servers_stored').value = sv.replace(/\n/g, '%');
-    document.getElementById('udp2raw_loglevel_val').value = ll;
-
-    var cmd = "/usr/bin/udp2raw-save "
+    var cmd = "/usr/bin/u2s "
         + shellEscape(en) + " "
-        + shellEscape(sv.replace(/\n/g, '%')) + " "
+        + shellEscape(compact) + " "
         + shellEscape(ll);
 
-    document.getElementById('system_cmd').value = cmd;
-
     var btn = document.getElementById('save_btn');
+    var msg = document.getElementById('apply_msg');
+
     if (btn){
         btn.value = 'Сохранение...';
         btn.disabled = true;
     }
+    if (msg) msg.innerHTML = 'Выполнение команды...';
 
-    document.form.submit();
-    setTimeout(function(){ window.location.href = '/Advanced_udp2raw.asp'; }, 4000);
+    $j.post('/apply.cgi', {
+        current_page: 'Advanced_udp2raw.asp',
+        next_page: 'Advanced_udp2raw.asp',
+        action_mode: ' SystemCmd ',
+        action_script: '',
+        SystemCmd: cmd
+    }, function(resp){
+        document.getElementById('udp2raw_enable_val').value = en;
+        document.getElementById('udp2raw_servers_stored').value = compact;
+        document.getElementById('udp2raw_loglevel_val').value = ll;
+        if (msg) msg.innerHTML = 'Команда отправлена. Обновление статуса...';
+        setTimeout(poll_status, 1000);
+        setTimeout(poll_status, 3000);
+        setTimeout(poll_status, 6000);
+    }).fail(function(){
+        if (msg) msg.innerHTML = 'Ошибка отправки команды';
+    }).always(function(){
+        if (btn){
+            btn.value = 'Сохранить и применить';
+            btn.disabled = false;
+        }
+    });
 }
 
 function done_validating(action){}
@@ -756,17 +750,6 @@ function done_validating(action){}
 </div>
 <br>
 <div id="Loading" class="popup_bg"></div>
-<iframe name="hidden_frame" id="hidden_frame" src="" width="0" height="0" frameborder="0" style="position:absolute;"></iframe>
-
-<form method="post" name="form" id="ruleForm" action="/apply.cgi" target="hidden_frame">
-<input type="hidden" name="current_page"  value="Advanced_udp2raw.asp">
-<input type="hidden" name="next_page"     value="Advanced_udp2raw.asp">
-<input type="hidden" name="next_host"     value="">
-<input type="hidden" name="group_id"      value="">
-<input type="hidden" name="action_mode"   value=" Refresh ">
-<input type="hidden" name="action_script" value="">
-<input type="hidden" name="flag"          value="">
-<input type="hidden" name="SystemCmd"     id="system_cmd" value="">
 
 <input type="hidden" id="udp2raw_enable_val" value="<% nvram_get_x("", "udp2raw_enable"); %>">
 <input type="hidden" id="udp2raw_servers_stored" value="<% nvram_get_x("", "udp2raw_servers"); %>">
@@ -789,8 +772,8 @@ function done_validating(action){}
         <div class="alert alert-info" style="margin:10px;">
           <b>Как работает:</b> OpenVPN &rarr; 127.0.0.1:3333 &rarr; udp2raw (faketcp) &rarr; сервер<br>
           DPI видит обычный TCP.<br><br>
-          <b>Важно:</b> эта версия сохраняет настройки напрямую через системную команду, без стандартного start_apply.htm.<br>
-          После сохранения будет сразу вызван restart_udp2raw.<br><br>
+          <b>Важно:</b> эта версия использует штатный Padavan SystemCmd через AJAX /apply.cgi — так же, как консольная страница.<br>
+          После сохранения вызывается <b>u2s</b> &rarr; <b>restart_udp2raw</b>.<br><br>
           <b>VPN клиент:</b> <a href="/vpncli.asp">Настройки</a>
           &rarr; Удалённый сервер: <b>127.0.0.1</b>, порт: <b>3333</b>, транспорт: <b>UDP</b>
         </div>
@@ -819,7 +802,7 @@ function done_validating(action){}
               <td colspan="2">
                 <textarea id="srv_text" rows="6" wrap="off" spellcheck="false" class="span12"
                   style="font-family:'Courier New';font-size:12px;"
-                  placeholder="89.39.70.30:4096:millenium2026&#10;server2.example.com:4096:millenium2026"></textarea>
+                  placeholder="89.39.70.159:4096:millenium2026&#10;server2.example.com:4096:millenium2026"></textarea>
                 <div class="help-text">Формат: ХОСТ:ПОРТ:ПАРОЛЬ, один на строку. Автоматический failover.</div>
               </td>
             </tr>
@@ -842,7 +825,7 @@ function done_validating(action){}
             <td style="border:0 none;text-align:center;">
               <input type="button" id="save_btn" class="btn btn-primary" style="width:219px"
                 onclick="applyRule();" value="Сохранить и применить">
-              <div class="help-text" style="text-align:center;margin-top:8px;">
+              <div id="apply_msg" class="help-text" style="text-align:center;margin-top:8px;">
                 Статус обновляется каждые 5 сек.
               </div>
             </td>
@@ -853,13 +836,13 @@ function done_validating(action){}
     </div>
   </div>
 </div></div>
-</form>
+
 <div id="footer"></div>
 </div>
 </body>
 </html>
 ASPEOF
-echo "  Created Advanced_udp2raw.asp v16.0"
+echo "  Created Advanced_udp2raw.asp v16.1"
 
 ############################################################
 # 11. state.js menu
@@ -912,90 +895,9 @@ patch_nvram_defaults() {
 patch_nvram_defaults "$TRUNK/user/shared/defaults.c" "shared/defaults.c"
 
 ############################################################
-# 13. variables.c
+# 13. vpnc_cus3 defaults
 ############################################################
-echo ">>> [12] variables.c"
-HTTPD_VARS="$TRUNK/user/httpd/variables.c"
-
-if [ ! -f "$HTTPD_VARS" ]; then
-    echo "  WARN: variables.c not found"
-else
-    cat > /tmp/patch_udp2raw_vars.py << 'PATCHPY'
-import re, sys
-
-FILE = sys.argv[1]
-NEW_VARS = ["udp2raw_enable", "udp2raw_servers", "udp2raw_status", "udp2raw_active", "udp2raw_loglevel"]
-
-with open(FILE) as f:
-    content = f.read()
-
-if "udp2raw_enable" in content:
-    print("  Already patched:", FILE)
-    sys.exit(0)
-
-print("  Patching:", FILE)
-
-m = re.search(r'struct\s+variable\s+\w+\s*$begin:math:display$\\s\*$end:math:display$\s*=\s*\{', content)
-if not m:
-    m = re.search(r'\bvariables\s*$begin:math:display$\\s\*$end:math:display$\s*=\s*\{', content)
-if not m:
-    print("  ERROR: variables array not found")
-    sys.exit(1)
-
-arr_open = m.end() - 1
-depth = 0
-arr_close = None
-
-for i in range(arr_open, len(content)):
-    if content[i] == '{':
-        depth += 1
-    elif content[i] == '}':
-        depth -= 1
-        if depth == 0:
-            arr_close = i
-            break
-
-if arr_close is None:
-    print("  ERROR: closing brace not found")
-    sys.exit(1)
-
-arr_body = content[arr_open+1:arr_close]
-ENTRY_RE = re.compile(r'^([\t ]+)\{([^}]+)\}', re.MULTILINE)
-entries = ENTRY_RE.findall(arr_body)
-
-if not entries:
-    print("  ERROR: no entries found")
-    sys.exit(1)
-
-indent = entries[0][0]
-new_entries = ""
-for var in NEW_VARS:
-    new_entries += indent + '{"' + var + '", "' + var + '", NULL, 1},\n'
-
-null_m = re.search(r'(\{NULL\s*,)', content[arr_open:arr_close])
-if null_m:
-    insert_pos = arr_open + null_m.start()
-    new_content = content[:insert_pos] + new_entries + content[insert_pos:]
-else:
-    before = content[:arr_close].rstrip('\n\r')
-    if before and not before.endswith(','):
-        before += ','
-    new_content = before + "\n" + new_entries + content[arr_close:]
-
-with open(FILE, 'w') as f:
-    f.write(new_content)
-
-print("  SUCCESS")
-PATCHPY
-
-    python3 /tmp/patch_udp2raw_vars.py "$HTTPD_VARS"
-    grep -n "udp2raw" "$HTTPD_VARS" && echo "  VERIFY OK" || echo "  VERIFY FAILED!"
-fi
-
-############################################################
-# 14. vpnc_cus3 MTU defaults
-############################################################
-echo ">>> [13] MTU defaults (vpnc_cus3)"
+echo ">>> [12] MTU defaults (vpnc_cus3)"
 for F in "$TRUNK/user/shared/defaults.c"; do
     [ -f "$F" ] || continue
     grep -q "vpnc_cus3" "$F" && { echo "  vpnc_cus3 already in $F"; continue; }
@@ -1012,9 +914,9 @@ for F in "$TRUNK/user/shared/defaults.c"; do
 done
 
 ############################################################
-# 15. rc.c helper registration
+# 14. rc.c helper registration
 ############################################################
-echo ">>> [14] ★ rc.c — add restart_udp2raw handler"
+echo ">>> [13] ★ rc.c — add restart_udp2raw handler"
 
 RC_FILE="$TRUNK/user/rc/rc.c"
 
@@ -1088,12 +990,12 @@ fi
 ############################################################
 echo
 echo "============================================"
-echo "  MILLENIUM Group VPN — build ready v16.0"
+echo "  MILLENIUM Group VPN — build ready v16.1"
 echo
 echo "  MODE:"
-echo "  - WebUI saves via /apply.cgi + SystemCmd"
+echo "  - WebUI uses real AJAX SystemCmd"
 echo "  - config in /etc/storage/udp2raw.conf"
-echo "  - watchdog is standalone daemon"
+echo "  - short wrapper /usr/bin/u2s"
 echo "============================================"
 
 echo
@@ -1102,42 +1004,6 @@ echo "--- Files ---"
 ls -la "$UDP2RAW_DIR/files/" 2>/dev/null
 echo "--- rc.c patch ---"
 grep -n "restart_udp2raw" "$TRUNK"/user/rc/*.c 2>/dev/null || echo "NOT FOUND in rc/*.c"
-echo "--- variables.c ---"
-grep -n "udp2raw_enable" "$TRUNK/user/httpd/variables.c" 2>/dev/null || echo "NOT FOUND"
-echo "--- ASP apply.cgi ---"
-grep -n "apply.cgi\|SystemCmd\|udp2raw-save" "$WWW/Advanced_udp2raw.asp" 2>/dev/null || true
+echo "--- ASP ---"
+grep -n "SystemCmd\|u2s\|action_mode: ' SystemCmd '" "$WWW/Advanced_udp2raw.asp" 2>/dev/null || true
 echo "=== END ==="
-
-echo ""
-echo "========== HTTPD / WEBUI DIAGNOSTICS =========="
-
-cd "$TRUNK"
-
-echo "--- grep: SystemCmd ---"
-grep -Rni "SystemCmd" user/www user/httpd || true
-
-echo "--- grep: apply.cgi ---"
-grep -Rni "apply.cgi" user/www user/httpd || true
-
-echo "--- grep: start_apply ---"
-grep -Rni "start_apply" user/www user/httpd || true
-
-echo "--- grep: action_mode ---"
-grep -Rni "action_mode" user/www/n56u_ribbon_fixed | head -200 || true
-
-echo "--- grep: restart_ ---"
-grep -Rni "restart_" user/www/n56u_ribbon_fixed | head -200 || true
-
-echo "--- grep: notify_rc ---"
-grep -Rni "notify_rc" user/httpd user/rc || true
-
-echo "--- grep: ej_ / do_apply / cgi ---"
-grep -Rni "do_apply_cgi\|apply_cgi\|ej_" user/httpd || true
-
-echo "--- grep: system( ---"
-grep -Rni 'system *(' user/httpd || true
-
-echo "--- files around httpd ---"
-find user/httpd -maxdepth 2 -type f | sort
-
-echo "========== END DIAGNOSTICS =========="
