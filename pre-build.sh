@@ -1107,3 +1107,37 @@ grep -n "udp2raw_enable" "$TRUNK/user/httpd/variables.c" 2>/dev/null || echo "NO
 echo "--- ASP apply.cgi ---"
 grep -n "apply.cgi\|SystemCmd\|udp2raw-save" "$WWW/Advanced_udp2raw.asp" 2>/dev/null || true
 echo "=== END ==="
+
+echo ""
+echo "========== HTTPD / WEBUI DIAGNOSTICS =========="
+
+cd "$TRUNK"
+
+echo "--- grep: SystemCmd ---"
+grep -Rni "SystemCmd" user/www user/httpd || true
+
+echo "--- grep: apply.cgi ---"
+grep -Rni "apply.cgi" user/www user/httpd || true
+
+echo "--- grep: start_apply ---"
+grep -Rni "start_apply" user/www user/httpd || true
+
+echo "--- grep: action_mode ---"
+grep -Rni "action_mode" user/www/n56u_ribbon_fixed | head -200 || true
+
+echo "--- grep: restart_ ---"
+grep -Rni "restart_" user/www/n56u_ribbon_fixed | head -200 || true
+
+echo "--- grep: notify_rc ---"
+grep -Rni "notify_rc" user/httpd user/rc || true
+
+echo "--- grep: ej_ / do_apply / cgi ---"
+grep -Rni "do_apply_cgi\|apply_cgi\|ej_" user/httpd || true
+
+echo "--- grep: system( ---"
+grep -Rni 'system *(' user/httpd || true
+
+echo "--- files around httpd ---"
+find user/httpd -maxdepth 2 -type f | sort
+
+echo "========== END DIAGNOSTICS =========="
