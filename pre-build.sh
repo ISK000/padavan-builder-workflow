@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v15.2
+# MILLENIUM Group — Padavan-NG pre-build v16.0
 #
-# v15.2 SAFE MODE:
-# - WebUI only saves NVRAM
-# - NO action_script from Apply page
-# - watchdog always starts from WAN hook
-# - watchdog starts/stops udp2raw based on udp2raw_enable
+# v16.0:
+# - FIX WebUI save path:
+#   NO start_apply.htm for custom vars
+#   use /apply.cgi + SystemCmd -> /usr/bin/udp2raw-save
 #
-# Reason:
-# direct custom action_script via start_apply.htm was causing
-# long apply hangs / admin disconnect / no logs.
+# - config is stored in:
+#   /etc/storage/udp2raw.conf
+#
+# - watchdog no longer depends on cru/crond
+#   uses background daemon with pidfile
+#
+# - nvram is used only as mirror for UI/status
 ############################################################
 set -euo pipefail
 
@@ -21,8 +24,8 @@ ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
 ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v15.2"
-echo "  SAFE MODE: save-only WebUI + watchdog"
+echo "  MILLENIUM Group VPN — pre-build v16.0"
+echo "  FIX: direct save via apply.cgi + SystemCmd"
 echo "============================================"
 
 ############################################################
@@ -78,6 +81,75 @@ echo "  OK: $(ls -lh "$UDP2RAW_DIR/files/udp2raw" | awk '{print $5}')"
 ############################################################
 echo ">>> [4] Scripts"
 
+cat > "$UDP2RAW_DIR/files/udp2raw-common" << 'CMEOF'
+#!/bin/sh
+
+CFG="/etc/storage/udp2raw.conf"
+
+cfg_load() {
+    UDP2RAW_ENABLE=0
+    UDP2RAW_SERVERS=""
+    UDP2RAW_LOGLEVEL=0
+
+    if [ -f "$CFG" ]; then
+        . "$CFG"
+    fi
+
+    [ -n "${UDP2RAW_ENABLE:-}" ] || UDP2RAW_ENABLE=0
+    [ -n "${UDP2RAW_SERVERS:-}" ] || UDP2RAW_SERVERS=""
+    [ -n "${UDP2RAW_LOGLEVEL:-}" ] || UDP2RAW_LOGLEVEL=0
+}
+
+nvram_sync() {
+    nvram set udp2raw_enable="${UDP2RAW_ENABLE:-0}"
+    nvram set udp2raw_servers="${UDP2RAW_SERVERS:-}"
+    nvram set udp2raw_loglevel="${UDP2RAW_LOGLEVEL:-0}"
+    nvram commit
+}
+CMEOF
+chmod +x "$UDP2RAW_DIR/files/udp2raw-common"
+
+cat > "$UDP2RAW_DIR/files/udp2raw-save" << 'SAVEOF'
+#!/bin/sh
+CFG="/etc/storage/udp2raw.conf"
+TMP="/tmp/udp2raw.conf.tmp"
+
+EN="${1:-0}"
+SRVS="${2:-}"
+LOGLEVEL="${3:-0}"
+
+safe() {
+    printf '%s' "$1" | sed 's/[\\`"$]/\\&/g'
+}
+
+EN_SAFE="$(safe "$EN")"
+SRVS_SAFE="$(safe "$SRVS")"
+LOGLEVEL_SAFE="$(safe "$LOGLEVEL")"
+
+mkdir -p /etc/storage
+
+cat > "$TMP" <<EOF
+#!/bin/sh
+UDP2RAW_ENABLE="$EN_SAFE"
+UDP2RAW_SERVERS="$SRVS_SAFE"
+UDP2RAW_LOGLEVEL="$LOGLEVEL_SAFE"
+EOF
+
+chmod 600 "$TMP"
+mv "$TMP" "$CFG"
+
+nvram set udp2raw_enable="$EN"
+nvram set udp2raw_servers="$SRVS"
+nvram set udp2raw_loglevel="$LOGLEVEL"
+nvram commit
+
+/sbin/mtd_storage.sh save >/dev/null 2>&1 || true
+
+/sbin/restart_udp2raw >/dev/null 2>&1 &
+echo "OK"
+SAVEOF
+chmod +x "$UDP2RAW_DIR/files/udp2raw-save"
+
 cat > "$UDP2RAW_DIR/files/udp2raw-ctl" << 'CTLEOF'
 #!/bin/sh
 PIDFILE="/var/run/udp2raw.pid"
@@ -95,7 +167,7 @@ do_start() {
     iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
     iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
 
-    LOGLVL=$(nvram get udp2raw_loglevel 2>/dev/null)
+    LOGLVL="${UDP2RAW_LOGLEVEL:-0}"
     [ -n "$LOGLVL" ] || LOGLVL=0
 
     /usr/bin/udp2raw -c \
@@ -148,17 +220,24 @@ chmod +x "$UDP2RAW_DIR/files/udp2raw-ctl"
 
 cat > "$UDP2RAW_DIR/files/fl-vpn-start" << 'VPNEOF'
 #!/bin/sh
+. /usr/bin/udp2raw-common
+
 LOG="/tmp/fl-vpn.log"
 exec >> "$LOG" 2>&1
 echo "=== fl-vpn-start $(date) ==="
 
-SERVERS=$(nvram get udp2raw_servers 2>/dev/null)
-[ -n "$SERVERS" ] || { echo "No servers in nvram"; nvram set udp2raw_status="NO CONFIG"; exit 1; }
+cfg_load
+nvram_sync
+
+SERVERS="$UDP2RAW_SERVERS"
+[ -n "$SERVERS" ] || { echo "No servers in config"; nvram set udp2raw_status="NO CONFIG"; nvram commit; exit 1; }
 
 echo "$SERVERS" | tr '%' '\n' > /tmp/vpn_srvlist
 /usr/bin/fl-vpn-stop 2>/dev/null
 sleep 1
 nvram set udp2raw_status="CONNECTING..."
+nvram set udp2raw_active=""
+nvram commit
 
 SKIP=$(cat /tmp/vpn_skip 2>/dev/null || echo "-1")
 OK=0
@@ -229,6 +308,7 @@ while IFS='' read -r line; do
     echo "$IDX" > /tmp/vpn_idx
     nvram set udp2raw_status="CONNECTED"
     nvram set udp2raw_active="$S:$P"
+    nvram commit
     echo "=== DONE $(date) ==="
     OK=1
     break
@@ -242,6 +322,8 @@ fi
 
 if [ "$OK" != "1" ]; then
     nvram set udp2raw_status="ALL FAILED"
+    nvram set udp2raw_active=""
+    nvram commit
     echo "FATAL: all servers failed"
     exit 1
 fi
@@ -257,6 +339,7 @@ fi
 /usr/bin/udp2raw-ctl stop 2>/dev/null
 nvram set udp2raw_status="DISCONNECTED"
 nvram set udp2raw_active=""
+nvram commit
 STOPEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-stop"
 
@@ -272,59 +355,103 @@ chmod +x "$UDP2RAW_DIR/files/fl-vpn-switch"
 
 cat > "$UDP2RAW_DIR/files/fl-vpn-watchdog" << 'WDEOF'
 #!/bin/sh
+. /usr/bin/udp2raw-common
+
+PIDFILE="/var/run/fl-vpn-watchdog.pid"
 LOG="/tmp/fl-vpn-wd.log"
 
-[ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 20000 ] && \
-    tail -30 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+loop() {
+    while true; do
+        cfg_load
+        nvram_sync
 
-cru l 2>/dev/null | grep -q "fl_vpn_wd" || {
-    cru a fl_vpn_wd "*/1 * * * * /usr/bin/fl-vpn-watchdog"
-    echo "$(date '+%H:%M') cron installed" >> "$LOG"
+        if [ "$UDP2RAW_ENABLE" != "1" ]; then
+            pidof udp2raw >/dev/null 2>&1 && {
+                /usr/bin/fl-vpn-stop
+                echo "$(date '+%H:%M:%S') disabled -> stopped" >> "$LOG"
+            }
+            sleep 10
+            continue
+        fi
+
+        if ! pidof udp2raw >/dev/null 2>&1; then
+            echo "$(date '+%H:%M:%S') udp2raw dead -> restart" >> "$LOG"
+            /usr/bin/fl-vpn-start >> "$LOG" 2>&1
+            sleep 10
+            continue
+        fi
+
+        if ! pidof openvpn >/dev/null 2>&1; then
+            echo "$(date '+%H:%M:%S') openvpn dead -> restart" >> "$LOG"
+            /usr/bin/fl-vpn-start >> "$LOG" 2>&1
+            sleep 10
+            continue
+        fi
+
+        for t in tun0 tun1 tun2; do
+            ip link show "$t" 2>/dev/null | grep -q UP || continue
+            GW=$(ip route show dev "$t" 2>/dev/null | awk '/via/{print $3}' | head -1)
+            [ -n "$GW" ] || GW="10.8.0.1"
+            ping -c2 -W5 -I "$t" "$GW" >/dev/null 2>&1 || {
+                echo "$(date '+%H:%M:%S') VPN dead via $t -> switch" >> "$LOG"
+                /usr/bin/fl-vpn-switch >> "$LOG" 2>&1
+            }
+            break
+        done
+
+        sleep 20
+    done
 }
 
-EN=$(nvram get udp2raw_enable 2>/dev/null)
-
-if [ "$EN" != "1" ]; then
-    pidof udp2raw >/dev/null 2>&1 && {
-        /usr/bin/fl-vpn-stop
-        echo "$(date '+%H:%M') disabled -> stopped" >> "$LOG"
-    }
-    exit 0
-fi
-
-if ! pidof udp2raw >/dev/null 2>&1; then
-    echo "$(date '+%H:%M') udp2raw dead -> restart" >> "$LOG"
-    /usr/bin/fl-vpn-start >> "$LOG" 2>&1 &
-    exit 0
-fi
-
-if ! pidof openvpn >/dev/null 2>&1; then
-    echo "$(date '+%H:%M') openvpn dead (udp2raw alive) -> restart" >> "$LOG"
-    /usr/bin/fl-vpn-start >> "$LOG" 2>&1 &
-    exit 0
-fi
-
-for t in tun0 tun1 tun2; do
-    ip link show "$t" 2>/dev/null | grep -q UP || continue
-    GW=$(ip route show dev "$t" 2>/dev/null | awk '/via/{print $3}' | head -1)
-    [ -n "$GW" ] || GW="10.8.0.1"
-    ping -c2 -W5 -I "$t" "$GW" >/dev/null 2>&1 || {
-        echo "$(date '+%H:%M') VPN dead via $t -> switch" >> "$LOG"
-        /usr/bin/fl-vpn-switch >> "$LOG" 2>&1 &
-    }
-    break
-done
+case "${1:-}" in
+    start)
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "watchdog already running"
+            exit 0
+        fi
+        loop &
+        echo $! > "$PIDFILE"
+        echo "watchdog started PID=$(cat "$PIDFILE")"
+        ;;
+    stop)
+        [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        rm -f "$PIDFILE"
+        echo "watchdog stopped"
+        ;;
+    restart)
+        [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        rm -f "$PIDFILE"
+        loop &
+        echo $! > "$PIDFILE"
+        echo "watchdog restarted PID=$(cat "$PIDFILE")"
+        ;;
+    status)
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "watchdog running PID=$(cat "$PIDFILE")"
+        else
+            echo "watchdog stopped"
+        fi
+        ;;
+    *)
+        echo "Usage: fl-vpn-watchdog {start|stop|restart|status}"
+        ;;
+esac
 WDEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-watchdog"
 
 cat > "$UDP2RAW_DIR/files/fl-vpn-status" << 'STEOF'
 #!/bin/sh
+. /usr/bin/udp2raw-common
+cfg_load
 echo "=== MILLENIUM VPN ==="
-printf "Enable:  %s\n" "$(nvram get udp2raw_enable 2>/dev/null || echo 0)"
-printf "Status:  %s\n" "$(nvram get udp2raw_status 2>/dev/null || echo '?')"
-printf "Server:  %s\n" "$(nvram get udp2raw_active 2>/dev/null || echo '-')"
-printf "udp2raw: %s\n" "$(pidof udp2raw >/dev/null && echo "ON ($(pidof udp2raw))" || echo OFF)"
-printf "openvpn: %s\n" "$(pidof openvpn >/dev/null && echo "ON ($(pidof openvpn))" || echo OFF)"
+printf "Enable(cfg):  %s\n" "$UDP2RAW_ENABLE"
+printf "Servers(cfg): %s\n" "$UDP2RAW_SERVERS"
+printf "Loglevel:     %s\n" "$UDP2RAW_LOGLEVEL"
+printf "Status:       %s\n" "$(nvram get udp2raw_status 2>/dev/null || echo '?')"
+printf "Server:       %s\n" "$(nvram get udp2raw_active 2>/dev/null || echo '-')"
+printf "udp2raw:      %s\n" "$(pidof udp2raw >/dev/null && echo "ON ($(pidof udp2raw))" || echo OFF)"
+printf "openvpn:      %s\n" "$(pidof openvpn >/dev/null && echo "ON ($(pidof openvpn))" || echo OFF)"
+printf "watchdog:     %s\n" "$(/usr/bin/fl-vpn-watchdog status)"
 [ -f /tmp/udp2raw.log ] && echo "--- last udp2raw ---" && tail -5 /tmp/udp2raw.log
 STEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-status"
@@ -332,28 +459,26 @@ chmod +x "$UDP2RAW_DIR/files/fl-vpn-status"
 echo "  Scripts OK"
 
 ############################################################
-# 5. restart_udp2raw — manual/service helper
+# 5. restart_udp2raw
 ############################################################
 echo ">>> [5] restart_udp2raw helper"
 mkdir -p "$ROMFS_SBIN"
 
 cat > "$ROMFS_SBIN/restart_udp2raw" << 'RSTEOF'
 #!/bin/sh
+. /usr/bin/udp2raw-common
+
 LOG="/tmp/udp2raw_restart.log"
 exec >> "$LOG" 2>&1
 
 echo "=== restart_udp2raw $(date) ==="
 
-EN=$(nvram get udp2raw_enable 2>/dev/null || echo 0)
-SRVS=$(nvram get udp2raw_servers 2>/dev/null || echo "")
-LOGLEVEL=$(nvram get udp2raw_loglevel 2>/dev/null || echo 0)
+cfg_load
+nvram_sync
 
-[ -n "$EN" ] || EN=0
-echo "  EN=$EN SRVS=$SRVS LOGLEVEL=$LOGLEVEL"
+echo "  EN=$UDP2RAW_ENABLE SRVS=$UDP2RAW_SERVERS LOGLEVEL=$UDP2RAW_LOGLEVEL"
 
-nvram commit 2>/dev/null
-
-if [ "$EN" = "1" ]; then
+if [ "$UDP2RAW_ENABLE" = "1" ]; then
     echo "  -> fl-vpn-start"
     /usr/bin/fl-vpn-start &
 else
@@ -361,7 +486,7 @@ else
     /usr/bin/fl-vpn-stop
 fi
 
-/usr/bin/fl-vpn-watchdog >/dev/null 2>&1 &
+/usr/bin/fl-vpn-watchdog restart >/dev/null 2>&1 || /usr/bin/fl-vpn-watchdog start >/dev/null 2>&1
 RSTEOF
 chmod +x "$ROMFS_SBIN/restart_udp2raw"
 cp "$ROMFS_SBIN/restart_udp2raw" "$UDP2RAW_DIR/files/restart_udp2raw"
@@ -369,28 +494,38 @@ chmod +x "$UDP2RAW_DIR/files/restart_udp2raw"
 echo "  Created restart_udp2raw"
 
 ############################################################
-# 6. WAN hook
+# 6. default config + WAN hook
 ############################################################
-echo ">>> [6] WAN hook → romfs"
+echo ">>> [6] default config + WAN hook"
 mkdir -p "$ROMFS_STORAGE"
+
+cat > "$ROMFS_STORAGE/udp2raw.conf" << 'CFGEOF'
+#!/bin/sh
+UDP2RAW_ENABLE="0"
+UDP2RAW_SERVERS=""
+UDP2RAW_LOGLEVEL="0"
+CFGEOF
+chmod +x "$ROMFS_STORAGE/udp2raw.conf"
 
 WAN_HOOK="$ROMFS_STORAGE/started_wan_hook.sh"
 cat > "$WAN_HOOK" << 'HOOKEOF'
 #!/bin/sh
-# MILLENIUM VPN v15.2 — watchdog-first startup
 sleep 3
 
-PRT=$(nvram get udp2raw_servers 2>/dev/null | cut -d'%' -f1 | cut -d: -f2)
+/usr/bin/fl-vpn-watchdog start >/dev/null 2>&1 || true
+
+CFG="/etc/storage/udp2raw.conf"
+if [ -f "$CFG" ]; then
+    . "$CFG"
+fi
+
+PRT=$(printf '%s' "${UDP2RAW_SERVERS:-}" | cut -d'%' -f1 | cut -d: -f2)
 if [ -n "$PRT" ] && echo "$PRT" | grep -qE '^[0-9]+$'; then
     iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
     iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
 fi
 
-# watchdog запускаем всегда, чтобы cron гарантированно установился
-/usr/bin/fl-vpn-watchdog >/dev/null 2>&1 &
-
-EN=$(nvram get udp2raw_enable 2>/dev/null)
-if [ "$EN" = "1" ]; then
+if [ "${UDP2RAW_ENABLE:-0}" = "1" ]; then
     sleep 2
     /usr/bin/fl-vpn-start &
 fi
@@ -429,14 +564,16 @@ all:
 
 romfs:
 	@echo "[udp2raw-tunnel] installing to romfs..."
-	$(ROMFSINST) -p +x files/udp2raw          /usr/bin/udp2raw
-	$(ROMFSINST) -p +x files/udp2raw-ctl      /usr/bin/udp2raw-ctl
-	$(ROMFSINST) -p +x files/fl-vpn-start     /usr/bin/fl-vpn-start
-	$(ROMFSINST) -p +x files/fl-vpn-stop      /usr/bin/fl-vpn-stop
-	$(ROMFSINST) -p +x files/fl-vpn-switch    /usr/bin/fl-vpn-switch
-	$(ROMFSINST) -p +x files/fl-vpn-watchdog  /usr/bin/fl-vpn-watchdog
-	$(ROMFSINST) -p +x files/fl-vpn-status    /usr/bin/fl-vpn-status
-	$(ROMFSINST) -p +x files/restart_udp2raw  /sbin/restart_udp2raw
+	$(ROMFSINST) -p +x files/udp2raw           /usr/bin/udp2raw
+	$(ROMFSINST) -p +x files/udp2raw-common    /usr/bin/udp2raw-common
+	$(ROMFSINST) -p +x files/udp2raw-save      /usr/bin/udp2raw-save
+	$(ROMFSINST) -p +x files/udp2raw-ctl       /usr/bin/udp2raw-ctl
+	$(ROMFSINST) -p +x files/fl-vpn-start      /usr/bin/fl-vpn-start
+	$(ROMFSINST) -p +x files/fl-vpn-stop       /usr/bin/fl-vpn-stop
+	$(ROMFSINST) -p +x files/fl-vpn-switch     /usr/bin/fl-vpn-switch
+	$(ROMFSINST) -p +x files/fl-vpn-watchdog   /usr/bin/fl-vpn-watchdog
+	$(ROMFSINST) -p +x files/fl-vpn-status     /usr/bin/fl-vpn-status
+	$(ROMFSINST) -p +x files/restart_udp2raw   /sbin/restart_udp2raw
 	@echo "[udp2raw-tunnel] DONE"
 
 clean:
@@ -574,21 +711,27 @@ function syncLogLevel(){
     }
 }
 
+function shellEscape(s){
+    return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
 function applyRule(){
     var sv = document.getElementById('srv_text').value;
     sv = sv.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
 
-    document.getElementById('udp2raw_servers_submit').value = sv.replace(/\n/g, '%');
-    document.getElementById('udp2raw_enable_val').value = document.getElementById('udp2raw_enable_sel').value;
-    document.getElementById('udp2raw_loglevel_val').value = document.getElementById('udp2raw_loglevel_sel').value;
+    var en  = document.getElementById('udp2raw_enable_sel').value;
+    var ll  = document.getElementById('udp2raw_loglevel_sel').value;
 
-    document.form.action_mode.value   = ' Apply ';
-    document.form.current_page.value  = 'Advanced_udp2raw.asp';
-    document.form.next_page.value     = 'Advanced_udp2raw.asp';
+    document.getElementById('udp2raw_enable_val').value = en;
+    document.getElementById('udp2raw_servers_stored').value = sv.replace(/\n/g, '%');
+    document.getElementById('udp2raw_loglevel_val').value = ll;
 
-    // SAFE MODE: ничего не вызываем напрямую
-    document.form.action_script.value = '';
-    document.form.sid_list.value      = '';
+    var cmd = "/usr/bin/udp2raw-save "
+        + shellEscape(en) + " "
+        + shellEscape(sv.replace(/\n/g, '%')) + " "
+        + shellEscape(ll);
+
+    document.getElementById('system_cmd').value = cmd;
 
     var btn = document.getElementById('save_btn');
     if (btn){
@@ -615,19 +758,19 @@ function done_validating(action){}
 <div id="Loading" class="popup_bg"></div>
 <iframe name="hidden_frame" id="hidden_frame" src="" width="0" height="0" frameborder="0" style="position:absolute;"></iframe>
 
-<form method="post" name="form" id="ruleForm" action="/start_apply.htm" target="hidden_frame">
+<form method="post" name="form" id="ruleForm" action="/apply.cgi" target="hidden_frame">
 <input type="hidden" name="current_page"  value="Advanced_udp2raw.asp">
 <input type="hidden" name="next_page"     value="Advanced_udp2raw.asp">
 <input type="hidden" name="next_host"     value="">
-<input type="hidden" name="sid_list"      value="">
 <input type="hidden" name="group_id"      value="">
-<input type="hidden" name="action_mode"   value="">
+<input type="hidden" name="action_mode"   value=" Refresh ">
 <input type="hidden" name="action_script" value="">
 <input type="hidden" name="flag"          value="">
-<input type="hidden" name="udp2raw_enable" id="udp2raw_enable_val" value="<% nvram_get_x("", "udp2raw_enable"); %>">
-<input type="hidden" name="udp2raw_servers" id="udp2raw_servers_submit" value="">
+<input type="hidden" name="SystemCmd"     id="system_cmd" value="">
+
+<input type="hidden" id="udp2raw_enable_val" value="<% nvram_get_x("", "udp2raw_enable"); %>">
 <input type="hidden" id="udp2raw_servers_stored" value="<% nvram_get_x("", "udp2raw_servers"); %>">
-<input type="hidden" name="udp2raw_loglevel" id="udp2raw_loglevel_val" value="<% nvram_get_x("", "udp2raw_loglevel"); %>">
+<input type="hidden" id="udp2raw_loglevel_val" value="<% nvram_get_x("", "udp2raw_loglevel"); %>">
 
 <div class="container-fluid"><div class="row-fluid">
   <div class="span3">
@@ -646,8 +789,8 @@ function done_validating(action){}
         <div class="alert alert-info" style="margin:10px;">
           <b>Как работает:</b> OpenVPN &rarr; 127.0.0.1:3333 &rarr; udp2raw (faketcp) &rarr; сервер<br>
           DPI видит обычный TCP.<br><br>
-          <b>Важно:</b> эта страница только сохраняет настройки. После сохранения запуск/остановка выполняется watchdog-ом автоматически.<br>
-          Обычно это происходит в течение ~1 минуты.<br><br>
+          <b>Важно:</b> эта версия сохраняет настройки напрямую через системную команду, без стандартного start_apply.htm.<br>
+          После сохранения будет сразу вызван restart_udp2raw.<br><br>
           <b>VPN клиент:</b> <a href="/vpncli.asp">Настройки</a>
           &rarr; Удалённый сервер: <b>127.0.0.1</b>, порт: <b>3333</b>, транспорт: <b>UDP</b>
         </div>
@@ -683,7 +826,7 @@ function done_validating(action){}
             <tr>
               <th width="50%">Подробное логирование</th>
               <td>
-                <select id="udp2raw_loglevel_sel" class="span4" onchange="document.getElementById('udp2raw_loglevel_val').value=this.value;">
+                <select id="udp2raw_loglevel_sel" class="span4">
                   <option value="0">Отключено</option>
                   <option value="3">Включено (уровень 3)</option>
                   <option value="5">Максимальное (уровень 5)</option>
@@ -698,7 +841,7 @@ function done_validating(action){}
           <tr>
             <td style="border:0 none;text-align:center;">
               <input type="button" id="save_btn" class="btn btn-primary" style="width:219px"
-                onclick="applyRule();" value="Сохранить настройки">
+                onclick="applyRule();" value="Сохранить и применить">
               <div class="help-text" style="text-align:center;margin-top:8px;">
                 Статус обновляется каждые 5 сек.
               </div>
@@ -716,7 +859,7 @@ function done_validating(action){}
 </body>
 </html>
 ASPEOF
-echo "  Created Advanced_udp2raw.asp v15.2"
+echo "  Created Advanced_udp2raw.asp v16.0"
 
 ############################################################
 # 11. state.js menu
@@ -769,7 +912,7 @@ patch_nvram_defaults() {
 patch_nvram_defaults "$TRUNK/user/shared/defaults.c" "shared/defaults.c"
 
 ############################################################
-# 13. variables.c — httpd whitelist
+# 13. variables.c
 ############################################################
 echo ">>> [12] variables.c"
 HTTPD_VARS="$TRUNK/user/httpd/variables.c"
@@ -792,9 +935,9 @@ if "udp2raw_enable" in content:
 
 print("  Patching:", FILE)
 
-m = re.search(r'struct\s+variable\s+\w+\s*\[\s*\]\s*=\s*\{', content)
+m = re.search(r'struct\s+variable\s+\w+\s*$begin:math:display$\\s\*$end:math:display$\s*=\s*\{', content)
 if not m:
-    m = re.search(r'\bvariables\s*\[\s*\]\s*=\s*\{', content)
+    m = re.search(r'\bvariables\s*$begin:math:display$\\s\*$end:math:display$\s*=\s*\{', content)
 if not m:
     print("  ERROR: variables array not found")
     sys.exit(1)
@@ -869,7 +1012,7 @@ for F in "$TRUNK/user/shared/defaults.c"; do
 done
 
 ############################################################
-# 15. rc.c — keep helper registration for manual use
+# 15. rc.c helper registration
 ############################################################
 echo ">>> [14] ★ rc.c — add restart_udp2raw handler"
 
@@ -945,12 +1088,12 @@ fi
 ############################################################
 echo
 echo "============================================"
-echo "  MILLENIUM Group VPN — build ready v15.2"
+echo "  MILLENIUM Group VPN — build ready v16.0"
 echo
 echo "  MODE:"
-echo "  - WebUI saves only"
-echo "  - watchdog starts/stops tunnel"
-echo "  - no direct action_script from page"
+echo "  - WebUI saves via /apply.cgi + SystemCmd"
+echo "  - config in /etc/storage/udp2raw.conf"
+echo "  - watchdog is standalone daemon"
 echo "============================================"
 
 echo
@@ -961,6 +1104,6 @@ echo "--- rc.c patch ---"
 grep -n "restart_udp2raw" "$TRUNK"/user/rc/*.c 2>/dev/null || echo "NOT FOUND in rc/*.c"
 echo "--- variables.c ---"
 grep -n "udp2raw_enable" "$TRUNK/user/httpd/variables.c" 2>/dev/null || echo "NOT FOUND"
-echo "--- ASP hidden fields ---"
-grep -n "udp2raw_enable_val\|udp2raw_servers_submit\|action_script" "$WWW/Advanced_udp2raw.asp" 2>/dev/null || true
+echo "--- ASP apply.cgi ---"
+grep -n "apply.cgi\|SystemCmd\|udp2raw-save" "$WWW/Advanced_udp2raw.asp" 2>/dev/null || true
 echo "=== END ==="
