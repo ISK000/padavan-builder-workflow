@@ -748,35 +748,19 @@ done
 ############################################################
 ############################################################
 ############################################################
-# 15. ★ КЛЮЧЕВОЙ ФИКС v15.0 ★
 ############################################################
-echo ">>> [14] ★ rc.c — register restart_udp2raw service"
+# 15. ★ КЛЮЧЕВОЙ ФИКС v15.0 ★
+#     rc.c содержит ТАБЛИЦУ сервисов (не if/else цепочку).
+#     Каждый сервис: { "restart_xxx", script, nvram_var, ... }
+#     Нужно добавить строку в эту таблицу рядом с restart_zapret.
+############################################################
+echo ">>> [14] ★ rc.c — add udp2raw to service table"
 
-RC_FILE="$TRUNK/user/rc/rc.c"
-echo "  --- DUMP: searching rc.c for notification handler ---"
-
-# Показать ВСЕ строки с notification, restart_, entry->d_name, opendir
-echo "  [notification lines]:"
-grep -n "notification\|notify\|NOTIFY" "$RC_FILE" 2>/dev/null | head -15
-echo "  [entry->d_name lines]:"
-grep -n "entry->d_name" "$RC_FILE" 2>/dev/null | head -15
-echo "  [opendir /tmp lines]:"
-grep -n "opendir\|readdir" "$RC_FILE" 2>/dev/null | head -15
-echo "  [restart_ with strcmp]:"
-grep -n "restart_.*strcmp\|strcmp.*restart_" "$RC_FILE" 2>/dev/null | head -15
-echo "  [restart_ in if blocks]:"
-grep -n 'if.*restart_\|restart_.*==' "$RC_FILE" 2>/dev/null | head -20
-echo "  [system.*restart]:"
-grep -n 'system.*restart_\|restart_.*system' "$RC_FILE" 2>/dev/null | head -10
-echo "  [all restart_ lines]:"
-grep -n "restart_" "$RC_FILE" 2>/dev/null | head -30
-echo "  --- END DUMP ---"
-
-# Теперь патчим — без exit 1 чтобы билд продолжился
 cat > /tmp/patch_rc_udp2raw.py << 'RCPY'
 import sys, re, os
 
-RC = sys.argv[1]
+RC = "padavan-ng/trunk/user/rc/rc.c"
+
 with open(RC) as f:
     content = f.read()
     lines = content.split('\n')
@@ -785,56 +769,165 @@ if "restart_udp2raw" in content:
     print("  Already patched")
     sys.exit(0)
 
-# Show total lines
-print(f"  rc.c total lines: {len(lines)}")
+print(f"  rc.c: {len(lines)} lines")
 
-# Find ALL lines with restart_ 
-all_restart = [(i, lines[i]) for i in range(len(lines)) if 'restart_' in lines[i]]
-print(f"  Total restart_ lines: {len(all_restart)}")
-for num, line in all_restart[:30]:
-    print(f"    {num+1}: {line.rstrip()}")
+# Strategy: find the line containing "restart_zapret" (as a string literal)
+# This is in a table/array — we insert a similar entry after it
 
-# Find the notification processing function
-# Search for opendir + rc_notification or /tmp/rc pattern
-notify_func_line = None
+zapret_line = None
 for i, line in enumerate(lines):
-    # Could be RC_NOTIFICATION_DIR or similar define
-    if 'opendir' in line and ('rc_' in line or 'notif' in line.lower() or '/tmp/' in line):
-        notify_func_line = i
-        print(f"  opendir at line {i+1}: {line.rstrip()}")
-    if 'readdir' in line and notify_func_line and i - notify_func_line < 30:
-        print(f"  readdir at line {i+1}: {line.rstrip()}")
+    if '"restart_zapret"' in line:
+        zapret_line = i
+        print(f"  Found 'restart_zapret' at line {i+1}: {line.rstrip()}")
+        break
 
-# If no opendir found, look for the format string
-if notify_func_line is None:
+if zapret_line is None:
+    # Maybe it's defined via macro or concatenation
+    # Search for just zapret in context of a struct/array initialization
     for i, line in enumerate(lines):
-        if 'notification' in line.lower():
-            print(f"  notification ref at {i+1}: {line.rstrip()}")
-            notify_func_line = i
+        if 'zapret' in line and ('{' in line or '"' in line):
+            print(f"  zapret ref at {i+1}: {line.rstrip()}")
+            # Show context
+            for j in range(max(0,i-3), min(len(lines), i+5)):
+                print(f"    {j+1}: {lines[j].rstrip()}")
+            zapret_line = i
+            break
 
-# Find function containing this line
-if notify_func_line:
-    func_start = notify_func_line
-    for j in range(notify_func_line, -1, -1):
-        stripped = lines[j].strip()
-        if re.match(r'^(static\s+)?(void|int)\s+\w+', stripped) and '(' in stripped:
-            func_start = j
+if zapret_line is None:
+    # Last resort: search for zapret.sh
+    for i, line in enumerate(lines):
+        if 'zapret.sh' in line:
+            zapret_line = i
+            print(f"  Found zapret.sh at line {i+1}: {line.rstrip()}")
+            break
+
+if zapret_line is None:
+    print("  ERROR: cannot find zapret in rc.c at all")
+    # Dump all lines containing 'zapret'
+    for i, line in enumerate(lines):
+        if 'zapret' in line.lower():
+            print(f"    {i+1}: {line.rstrip()}")
+    sys.exit(1)
+
+# Show surrounding context (10 lines before and after)
+print(f"  --- Context around line {zapret_line+1} ---")
+for j in range(max(0, zapret_line-10), min(len(lines), zapret_line+15)):
+    marker = " >>>" if j == zapret_line else "    "
+    print(f"  {marker} {j+1}: {lines[j].rstrip()}")
+print(f"  --- End context ---")
+
+# Determine the format of the table entry by analyzing the zapret line
+zline = lines[zapret_line]
+
+# Case 1: full entry on one line: { "restart_zapret", ... },
+if '{' in zline and 'restart_zapret' in zline:
+    # Copy the format, replace zapret with udp2raw
+    new_line = zline.replace('restart_zapret', 'restart_udp2raw')
+    new_line = new_line.replace('zapret.sh', 'restart_udp2raw')
+    new_line = new_line.replace('zapret_enable', 'udp2raw_enable')
+    new_line = new_line.replace('zapret', 'udp2raw')
+    
+    # But we need /sbin/restart_udp2raw as the script path
+    # Replace whatever script path is there
+    new_line = re.sub(r'"/usr/bin/[^"]*"', '"/sbin/restart_udp2raw"', new_line)
+    
+    lines.insert(zapret_line + 1, new_line)
+    print(f"  Inserted (case 1): {new_line.rstrip()}")
+
+# Case 2: entry spans multiple lines 
+elif '"restart_zapret"' in zline:
+    # Find the end of this entry (next line with }, or next entry with {)
+    entry_end = zapret_line
+    for j in range(zapret_line, min(zapret_line + 10, len(lines))):
+        if '}' in lines[j] and j >= zapret_line:
+            entry_end = j
             break
     
-    print(f"  Function starts at {func_start+1}: {lines[func_start].rstrip()}")
+    # Copy all lines of this entry
+    entry_lines = lines[zapret_line:entry_end+1]
+    new_entry = []
+    for el in entry_lines:
+        nl = el.replace('restart_zapret', 'restart_udp2raw')
+        nl = nl.replace('zapret.sh', 'restart_udp2raw')
+        nl = nl.replace('zapret_enable', 'udp2raw_enable')
+        nl = nl.replace('/usr/bin/zapret', '/sbin/restart_udp2raw')
+        nl = nl.replace('zapret', 'udp2raw')
+        new_entry.append(nl)
     
-    # Dump 100 lines of this function
-    print(f"  --- Function dump (lines {func_start+1} to {min(func_start+100, len(lines))}) ---")
-    for j in range(func_start, min(func_start + 100, len(lines))):
-        print(f"    {j+1}: {lines[j].rstrip()}")
-    print(f"  --- End dump ---")
+    for idx, nl in enumerate(new_entry):
+        lines.insert(entry_end + 1 + idx, nl)
+    print(f"  Inserted (case 2, {len(new_entry)} lines)")
+    for nl in new_entry:
+        print(f"    {nl.rstrip()}")
 
-print("  DIAGNOSTIC ONLY — not patching yet")
-sys.exit(0)
+# Case 3: zapret.sh found (not restart_zapret as literal)
+else:
+    # Get indent
+    indent = re.match(r'^(\s*)', zline).group(1)
+    
+    # Look at the surrounding structure to understand format
+    # Find the entry that contains this line
+    entry_start = zapret_line
+    for j in range(zapret_line, max(0, zapret_line-5), -1):
+        if '{' in lines[j]:
+            entry_start = j
+            break
+    entry_end = zapret_line
+    for j in range(zapret_line, min(zapret_line+5, len(lines))):
+        if '}' in lines[j]:
+            entry_end = j
+            break
+    
+    entry_lines = lines[entry_start:entry_end+1]
+    print(f"  Entry block ({entry_start+1}-{entry_end+1}):")
+    for el in entry_lines:
+        print(f"    {el.rstrip()}")
+    
+    # Clone and modify
+    new_entry = []
+    for el in entry_lines:
+        nl = el.replace('restart_zapret', 'restart_udp2raw')
+        nl = nl.replace('zapret.sh', 'restart_udp2raw')
+        nl = nl.replace('/usr/bin/zapret', '/sbin/restart_udp2raw')
+        nl = nl.replace('zapret_enable', 'udp2raw_enable')
+        nl = nl.replace('zapret', 'udp2raw')
+        new_entry.append(nl)
+    
+    for idx, nl in enumerate(new_entry):
+        lines.insert(entry_end + 1 + idx, nl)
+    print(f"  Inserted (case 3, {len(new_entry)} lines)")
+    for nl in new_entry:
+        print(f"    {nl.rstrip()}")
+
+# Write
+content = '\n'.join(lines)
+with open(RC, 'w') as f:
+    f.write(content)
+
+# Verify
+with open(RC) as f:
+    v = f.read()
+if "restart_udp2raw" in v:
+    vlines = v.split('\n')
+    for i, line in enumerate(vlines):
+        if 'restart_udp2raw' in line:
+            for j in range(max(0,i-2), min(len(vlines),i+5)):
+                print(f"  {j+1}: {vlines[j]}")
+            break
+    print("  VERIFY OK")
+else:
+    print("  VERIFY FAILED!")
+    sys.exit(1)
 RCPY
 
-python3 /tmp/patch_rc_udp2raw.py "$RC_FILE"
-echo "  (diagnostic mode — build continues without rc.c patch)"
+python3 /tmp/patch_rc_udp2raw.py
+RC_RESULT=$?
+
+if [ "$RC_RESULT" -ne 0 ]; then
+    echo "  *** CRITICAL: rc.c patch FAILED ***"
+    echo "  Without this patch, WebUI button will NOT work."
+    exit 1
+fi
 
 ############################################################
 echo ""
