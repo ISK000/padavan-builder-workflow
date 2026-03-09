@@ -1,31 +1,16 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v14.0
+# MILLENIUM Group — Padavan-NG pre-build v15.0
 #
-# ROOT CAUSE HISTORY:
-#  v5-v6: variables.c не патчился (break в цикле). httpd
-#         игнорировал udp2raw_* переменные — toggle сбрасывался.
-#  v7:    variables.c патчился НЕПРАВИЛЬНЫМ форматом:
-#         вставлялся { "name", "val" } (defaults.c формат),
-#         а variables.c ожидает { "name", int_flags } или
-#         { "ServiceId", "name", int_flags } — разные структуры.
-#         Кроме того, v7 НИКОГДА НЕ СОБИРАЛСЯ (CI гонял v6).
+# ROOT CAUSE FIXED IN v15.0:
 #
-# ИСПРАВЛЕНО В v8.0:
+#  httpd → notify_rc("restart_udp2raw") → rc демон
+#  rc НЕ ЗНАЛ сервис "restart_udp2raw" → молча игнорировал.
+#  nvram сохранялся, скрипт НЕ вызывался.
 #
-#  1. restart_udp2raw получает enable+servers КАК АРГУМЕНТЫ
-#     через action_script поле формы. Скрипт сам сохраняет
-#     значения в nvram. variables.c whitelist БОЛЬШЕ НЕ БЛОКИРУЕТ.
-#     (Belt+suspenders: variables.c тоже патчится правильно)
-#
-#  2. Разделитель серверов '>' заменён на '%' — '>' в строке
-#     серверов интерпретировался shell как редирект при вызове
-#     через action_script.
-#
-#  3. variables.c патчится с АВТО-ДЕТЕКТОМ формата (2-field или
-#     3-field) по существующим записям в файле.
-#
-#  4. CSS toggle (без itoggle) — сохранён из v7.0.
+#  FIX: патч rc/rc.c — добавляем обработчик restart_udp2raw
+#  рядом с restart_zapret (тот же паттерн).
+#  ASP использует action_script="restart_udp2raw" (имя сервиса).
 ############################################################
 set -euo pipefail
 
@@ -36,8 +21,8 @@ ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
 ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v14.0"
-echo "  FIX: action_script без аргументов, httpd сохраняет nvram"
+echo "  MILLENIUM Group VPN — pre-build v15.0"
+echo "  FIX: rc.c патч — restart_udp2raw как сервис"
 echo "============================================"
 
 ############################################################
@@ -88,7 +73,7 @@ cd "$OLDPWD"
 echo "  OK: $(ls -lh $UDP2RAW_DIR/files/udp2raw | awk '{print $5}')"
 
 ############################################################
-# 4. udp2raw-ctl
+# 4. Shell скрипты (udp2raw-ctl, fl-vpn-*)
 ############################################################
 echo ">>> [4] Scripts"
 cat > "$UDP2RAW_DIR/files/udp2raw-ctl" << 'CTLEOF'
@@ -99,13 +84,9 @@ LOGFILE="/tmp/udp2raw.log"
 do_start() {
     [ -f /tmp/udp2raw_srv ] && . /tmp/udp2raw_srv || { echo "No server config"; return 1; }
     [ -z "$SRV" ] && { echo "SRV empty"; return 1; }
-
     killall udp2raw 2>/dev/null; sleep 1
-
-    # dedup + INSERT в позицию 1 (не APPEND в конец)
     iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
     iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
-
     LOGLVL=$(nvram get udp2raw_loglevel 2>/dev/null)
     [ -z "$LOGLVL" ] && LOGLVL=0
     /usr/bin/udp2raw -c \
@@ -147,9 +128,6 @@ esac
 CTLEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-ctl"
 
-############################################################
-# 5. fl-vpn-start
-############################################################
 cat > "$UDP2RAW_DIR/files/fl-vpn-start" << 'VPNEOF'
 #!/bin/sh
 LOG="/tmp/fl-vpn.log"
@@ -164,7 +142,6 @@ nvram set udp2raw_status="CONNECTING..."
 
 SKIP=$(cat /tmp/vpn_skip 2>/dev/null || echo "-1")
 OK=0
-# Разделитель % (не >, т.к. > интерпретируется shell как редирект)
 echo "$SERVERS" | tr '%' '\n' > /tmp/vpn_srvlist
 
 resolve_host() {
@@ -228,9 +205,6 @@ fi
 VPNEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-start"
 
-############################################################
-# 6. fl-vpn-stop
-############################################################
 cat > "$UDP2RAW_DIR/files/fl-vpn-stop" << 'STOPEOF'
 #!/bin/sh
 [ -f /tmp/udp2raw_srv ] && { . /tmp/udp2raw_srv; ip route del "$SRV/32" 2>/dev/null; }
@@ -240,9 +214,6 @@ nvram set udp2raw_active=""
 STOPEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-stop"
 
-############################################################
-# 7. fl-vpn-switch
-############################################################
 cat > "$UDP2RAW_DIR/files/fl-vpn-switch" << 'SWEOF'
 #!/bin/sh
 C=$(cat /tmp/vpn_idx 2>/dev/null || echo 0)
@@ -252,9 +223,6 @@ fl-vpn-start &
 SWEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-switch"
 
-############################################################
-# 8. fl-vpn-watchdog
-############################################################
 cat > "$UDP2RAW_DIR/files/fl-vpn-watchdog" << 'WDEOF'
 #!/bin/sh
 LOG="/tmp/fl-vpn-wd.log"
@@ -282,7 +250,6 @@ if ! pidof udp2raw >/dev/null 2>&1; then
     exit 0
 fi
 
-# Если udp2raw жив, но OpenVPN не запущен — перезапускаем туннель
 if ! pidof openvpn >/dev/null 2>&1; then
     echo "$(date '+%H:%M') openvpn dead (udp2raw alive) -> restart" >> "$LOG"
     fl-vpn-start >> "$LOG" 2>&1 &
@@ -302,9 +269,6 @@ done
 WDEOF
 chmod +x "$UDP2RAW_DIR/files/fl-vpn-watchdog"
 
-############################################################
-# 9. fl-vpn-status
-############################################################
 cat > "$UDP2RAW_DIR/files/fl-vpn-status" << 'STEOF'
 #!/bin/sh
 echo "=== MILLENIUM VPN ==="
@@ -320,46 +284,27 @@ chmod +x "$UDP2RAW_DIR/files/fl-vpn-status"
 echo "  Scripts OK"
 
 ############################################################
-# 10. restart_udp2raw — action_script hook для Padavan WebUI
+# 5. restart_udp2raw — скрипт вызываемый rc демоном
 ############################################################
-echo ">>> [5] restart_udp2raw (action_script hook)"
+echo ">>> [5] restart_udp2raw (rc service script)"
 mkdir -p "$ROMFS_SBIN"
 
 cat > "$ROMFS_SBIN/restart_udp2raw" << 'RSTEOF'
 #!/bin/sh
-# Вызывается Padavan httpd как action_script после submit формы.
-# АРГУМЕНТЫ (передаются через action_script поле формы):
-#   $1 = enable  (0 или 1)
-#   $2 = servers (HOST:PORT:KEY разделённые %)
-#
-# v8.0 FIX: скрипт СОХРАНЯЕТ значения в nvram сам — не зависит
-# от variables.c whitelist. Также читает nvram как fallback.
+# Вызывается rc демоном через notify_rc("restart_udp2raw").
+# httpd уже сохранил udp2raw_enable + udp2raw_servers в nvram.
+# Этот скрипт просто читает nvram и запускает/останавливает.
 
 LOG="/tmp/udp2raw_restart.log"
 exec >> "$LOG" 2>&1
-echo "=== restart_udp2raw $(date) args=$* ==="
+echo "=== restart_udp2raw $(date) ==="
 
-# Принять аргументы от action_script или читать из nvram
-if [ $# -ge 1 ] && [ -n "$1" ]; then
-    EN="$1"
-else
-    EN=$(nvram get udp2raw_enable 2>/dev/null || echo 0)
-fi
+EN=$(nvram get udp2raw_enable 2>/dev/null || echo 0)
+SRVS=$(nvram get udp2raw_servers 2>/dev/null || echo "")
 
-if [ $# -ge 2 ] && [ -n "$2" ]; then
-    SRVS="$2"
-else
-    SRVS=$(nvram get udp2raw_servers 2>/dev/null || echo "")
-fi
-
-[ -z "$EN" ]   && EN=0
-[ -z "$SRVS" ] && SRVS=""
-
+[ -z "$EN" ] && EN=0
 echo "  EN=$EN SRVS=$SRVS"
 
-# Сохранить в nvram (belt-and-suspenders)
-nvram set udp2raw_enable="$EN"   2>/dev/null
-nvram set udp2raw_servers="$SRVS" 2>/dev/null
 nvram commit 2>/dev/null
 
 if [ "$EN" = "1" ]; then
@@ -371,52 +316,29 @@ else
 fi
 RSTEOF
 chmod +x "$ROMFS_SBIN/restart_udp2raw"
-# Также копируем в files/ для установки через Makefile ROMFSINST
 cp "$ROMFS_SBIN/restart_udp2raw" "$UDP2RAW_DIR/files/restart_udp2raw"
 chmod +x "$UDP2RAW_DIR/files/restart_udp2raw"
-echo "  Created $ROMFS_SBIN/restart_udp2raw + files/restart_udp2raw"
+echo "  Created restart_udp2raw"
 
 ############################################################
-# 11. WAN hook вшитый в romfs
+# 6. WAN hook
 ############################################################
 echo ">>> [6] WAN hook → romfs"
 mkdir -p "$ROMFS_STORAGE"
 
 WAN_HOOK="$ROMFS_STORAGE/started_wan_hook.sh"
-if [ -f "$WAN_HOOK" ]; then
-    if ! grep -q "fl-vpn-watchdog" "$WAN_HOOK"; then
-        cat >> "$WAN_HOOK" << 'HOOKEOF'
-
-# MILLENIUM VPN v8.0 — udp2raw autostart
-sleep 3
-PRT=$(nvram get udp2raw_servers 2>/dev/null | cut -d'%' -f1 | cut -d: -f2)
-if [ -n "$PRT" ] && echo "$PRT" | grep -qE '^[0-9]+$'; then
-    iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
-    iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
-fi
-EN=$(nvram get udp2raw_enable 2>/dev/null)
-if [ "$EN" = "1" ]; then
-    sleep 2 && /usr/bin/fl-vpn-start &
-else
-    sleep 2 && /usr/bin/fl-vpn-watchdog &
-fi
-HOOKEOF
-        echo "  Appended to existing $WAN_HOOK"
-    else
-        echo "  Already patched: $WAN_HOOK"
-    fi
+if [ -f "$WAN_HOOK" ] && grep -q "fl-vpn-watchdog" "$WAN_HOOK"; then
+    echo "  Already patched: $WAN_HOOK"
 else
     cat > "$WAN_HOOK" << 'HOOKEOF'
 #!/bin/sh
-# MILLENIUM VPN v8.0 — udp2raw autostart
-# Запускается автоматически при поднятии WAN.
+# MILLENIUM VPN v15.0 — udp2raw autostart at WAN up
 sleep 3
 PRT=$(nvram get udp2raw_servers 2>/dev/null | cut -d'%' -f1 | cut -d: -f2)
 if [ -n "$PRT" ] && echo "$PRT" | grep -qE '^[0-9]+$'; then
     iptables -D OUTPUT -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP 2>/dev/null
     iptables -I OUTPUT 1 -p tcp --dport "$PRT" --tcp-flags RST RST -j DROP
 fi
-# Если включён — запускаем напрямую, не ждём cron watchdog
 EN=$(nvram get udp2raw_enable 2>/dev/null)
 if [ "$EN" = "1" ]; then
     sleep 2 && /usr/bin/fl-vpn-start &
@@ -429,17 +351,15 @@ fi
 chmod +x "$WAN_HOOK"
 
 ############################################################
-# 12. custom-extras
+# 7. custom-extras
 ############################################################
 echo ">>> [7] custom-extras"
 CUSTOM_DIR="$TRUNK/user/custom-extras"
-if [ -d "$CUSTOM_DIR" ]; then
-    mkdir -p "$CUSTOM_DIR/files/etc/storage/wireguard"
-fi
+[ -d "$CUSTOM_DIR" ] && mkdir -p "$CUSTOM_DIR/files/etc/storage/wireguard"
 echo "  OK"
 
 ############################################################
-# 13. Patch user/Makefile
+# 8. Patch user/Makefile
 ############################################################
 echo ">>> [8] user/Makefile patch"
 UMAKEFILE="$TRUNK/user/Makefile"
@@ -452,7 +372,7 @@ else
 fi
 
 ############################################################
-# 14. Makefile для udp2raw-tunnel
+# 9. Makefile для udp2raw-tunnel
 ############################################################
 cat > "$UDP2RAW_DIR/Makefile" << 'MKEOF'
 all:
@@ -467,8 +387,8 @@ romfs:
 	$(ROMFSINST) -p +x files/fl-vpn-stop      /usr/bin/fl-vpn-stop
 	$(ROMFSINST) -p +x files/fl-vpn-switch    /usr/bin/fl-vpn-switch
 	$(ROMFSINST) -p +x files/fl-vpn-watchdog  /usr/bin/fl-vpn-watchdog
-	$(ROMFSINST) -p +x files/fl-vpn-status       /usr/bin/fl-vpn-status
-	$(ROMFSINST) -p +x files/restart_udp2raw     /sbin/restart_udp2raw
+	$(ROMFSINST) -p +x files/fl-vpn-status    /usr/bin/fl-vpn-status
+	$(ROMFSINST) -p +x files/restart_udp2raw  /sbin/restart_udp2raw
 	@echo "[udp2raw-tunnel] DONE"
 
 clean:
@@ -476,30 +396,14 @@ clean:
 MKEOF
 
 ############################################################
-# 15. AJAX статус endpoint
+# 10. ASP + status endpoint
 ############################################################
-echo ">>> [9] WebUI"
+echo ">>> [9] WebUI ASP"
 cat > "$WWW/millenium_status.asp" << 'EOF'
 <% nvram_get_x("", "udp2raw_status"); %>|<% nvram_get_x("", "udp2raw_active"); %>
 EOF
 
-############################################################
-# 16. ASP страница MILLENIUM VPN v7.0
-#
-# КЛЮЧЕВЫЕ ИЗМЕНЕНИЯ v7.0:
-#
-# A) CSS TOGGLE вместо itoggle:
-#    Причина: itoggle не гарантирует синхронизацию radio button
-#    при submit формы (особенно в версиях Padavan 3.4.x).
-#    Новый toggle — чистый CSS checkbox + hidden input
-#    "udp2raw_enable" который ВСЕГДА правильно устанавливается
-#    через onEnableChange(). Нет зависимости от библиотек.
-#
-# B) HIDDEN INPUT вместо radio buttons:
-#    <input type="hidden" name="udp2raw_enable" id="udp2raw_enable_val">
-#    Значение устанавливается JS при клике на toggle.
-#    Гарантированно попадает в POST при submit формы.
-############################################################
+# v15.0 ASP — action_script="restart_udp2raw" (имя сервиса для rc)
 cat > "$WWW/Advanced_udp2raw.asp" << 'ASPEOF'
 <!DOCTYPE html>
 <html>
@@ -518,24 +422,18 @@ cat > "$WWW/Advanced_udp2raw.asp" << 'ASPEOF'
 <script type="text/javascript" src="/general.js"></script>
 <script type="text/javascript" src="/popup.js"></script>
 <style>
-/* ── Стили ── */
 .help-text  { color: #888; font-size: 11px; margin-top: 3px; }
 .status-box { background: #f5f5f5; border-radius: 6px; padding: 12px 16px; margin: 10px; }
 </style>
-<script>
-var $j = jQuery.noConflict();
-</script>
+<script>var $j = jQuery.noConflict();</script>
 <script>
 <% login_state_hook(); %>
 var m_status = '<% nvram_get_x("", "udp2raw_status"); %>';
-var m_active  = '<% nvram_get_x("", "udp2raw_active"); %>';
+var m_active = '<% nvram_get_x("", "udp2raw_active"); %>';
 
 function initial(){
     show_banner(0); show_menu(7,-1,0); show_footer();
-    load_body();
-    load_servers();
-    syncToggle();
-    syncLogLevel();
+    load_body(); load_servers(); syncToggle(); syncLogLevel();
     update_status();
     var ld = document.getElementById('Loading');
     if (ld) ld.style.display = 'none';
@@ -546,115 +444,77 @@ function initial(){
 function poll_status(){
     $j.get('/millenium_status.asp?t=' + Date.now(), function(d){
         var p = d.split('|');
-        if (p.length >= 2){
-            m_status = p[0].trim();
-            m_active  = p[1].trim();
-            update_status();
-        }
+        if (p.length >= 2){ m_status = p[0].trim(); m_active = p[1].trim(); update_status(); }
     });
 }
 
 function inject_menu(){
     var sub = document.getElementById('subMenu');
-    if (!sub) return;
-    if (sub.innerHTML.indexOf('Advanced_udp2raw') >= 0) return;
+    if (!sub || sub.innerHTML.indexOf('Advanced_udp2raw') >= 0) return;
     var groups = sub.getElementsByClassName('accordion-group');
     if (groups.length > 0){
         var d = document.createElement('div');
         d.className = 'accordion-group';
-        d.innerHTML = '<div class="accordion-heading"><a class="accordion-toggle"'
-            + ' style="padding:5px 15px;" href="/Advanced_udp2raw.asp">'
-            + '<b>MILLENIUM VPN</b></a></div>';
+        d.innerHTML = '<div class="accordion-heading"><a class="accordion-toggle" style="padding:5px 15px;" href="/Advanced_udp2raw.asp"><b>MILLENIUM VPN</b></a></div>';
         groups[groups.length-1].parentNode.appendChild(d);
     }
 }
 
 function update_status(){
-    var s    = m_status || 'DISCONNECTED';
-    var el   = document.getElementById('vpn_status');
+    var s = m_status || 'DISCONNECTED';
+    var el = document.getElementById('vpn_status');
     var info = document.getElementById('vpn_info');
     if (!el) return;
     if (s == 'CONNECTED'){
-        el.innerHTML = '<span class="label label-success"'
-            + ' style="font-size:14px;padding:5px 12px;">&#x25CF; Туннель активен</span>';
+        el.innerHTML = '<span class="label label-success" style="font-size:14px;padding:5px 12px;">&#x25CF; Туннель активен</span>';
         info.innerHTML = m_active ? 'Сервер: <b>' + m_active + '</b>' : '';
     } else if (s == 'CONNECTING...'){
-        el.innerHTML = '<span class="label label-warning"'
-            + ' style="font-size:14px;padding:5px 12px;">&#x25CF; Подключение...</span>';
+        el.innerHTML = '<span class="label label-warning" style="font-size:14px;padding:5px 12px;">&#x25CF; Подключение...</span>';
         info.innerHTML = '<i>Перебор серверов...</i>';
     } else {
-        el.innerHTML = '<span class="label label-important"'
-            + ' style="font-size:14px;padding:5px 12px;">&#x25CB; Туннель выкл.</span>';
-        info.innerHTML = (s && s != 'DISCONNECTED')
-            ? '<span style="color:#c00">' + s + '</span>' : '';
+        el.innerHTML = '<span class="label label-important" style="font-size:14px;padding:5px 12px;">&#x25CB; Туннель выкл.</span>';
+        info.innerHTML = (s && s != 'DISCONNECTED') ? '<span style="color:#c00">' + s + '</span>' : '';
     }
 }
 
-// v14.0: SELECT-based enable (как у zapret)
 function syncToggle(){
     var val = document.getElementById('udp2raw_enable_val').value || '0';
     var sel = document.getElementById('udp2raw_enable_sel');
-    if (!sel) return;
-    sel.value = val;
-    change_enabled();
+    if (sel) { sel.value = val; change_enabled(); }
 }
-
-function onEnableChange(val){
-    change_enabled();
-}
-
+function onEnableChange(val){ change_enabled(); }
 function change_enabled(){
     var sel = document.getElementById('udp2raw_enable_sel');
-    var enabled = sel && sel.value === '1';
-    showhide_div('cfg_main', enabled);
+    showhide_div('cfg_main', sel && sel.value === '1');
 }
-
 function load_servers(){
     var fld = document.getElementById('udp2raw_servers_stored');
-    if (!fld) return;
-    document.getElementById('srv_text').value = fld.value.replace(/%/g, '\n');
+    if (fld) document.getElementById('srv_text').value = fld.value.replace(/%/g, '\n');
 }
-
 function syncLogLevel(){
     var val = document.getElementById('udp2raw_loglevel_val').value || '0';
     var sel = document.getElementById('udp2raw_loglevel_sel');
     if (!sel) return;
-    for (var i = 0; i < sel.options.length; i++){
+    for (var i = 0; i < sel.options.length; i++)
         if (sel.options[i].value === val){ sel.selectedIndex = i; break; }
-    }
 }
 
+/* v15.0 FIX: action_script = "restart_udp2raw" (имя сервиса для rc демона).
+ * httpd сохраняет nvram → notify_rc("restart_udp2raw") → rc вызывает /sbin/restart_udp2raw.
+ * Штатный механизм Padavan, как restart_zapret, restart_tor и др. */
 function applyRule(){
-    // v14.0: select name="udp2raw_enable" сохраняется автоматически в POST
     var sv = document.getElementById('srv_text').value;
     sv = sv.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
-    var srvPct = sv.replace(/\n/g, '%');
-    document.form.udp2raw_servers.value = srvPct;
-    document.form.action_mode.value  = ' Apply ';
-    document.form.current_page.value = 'Advanced_udp2raw.asp';
-    document.form.next_page.value    = 'Advanced_udp2raw.asp';
-    document.form.action_script.value = '/sbin/restart_udp2raw';
+    document.form.udp2raw_servers.value = sv.replace(/\n/g, '%');
+    document.form.action_mode.value    = ' Apply ';
+    document.form.current_page.value   = 'Advanced_udp2raw.asp';
+    document.form.next_page.value      = 'Advanced_udp2raw.asp';
+    document.form.action_script.value  = 'restart_udp2raw';
 
     var btn = document.getElementById('save_btn');
     if (btn) { btn.value = 'Сохранение...'; btn.disabled = true; }
     document.form.submit();
-
-    // v14.0 FIX 2: второй POST через 1.5с для гарантированного вызова action_script
-    // Не зависит от restart_needed_bits в variables.c вообще.
-    setTimeout(function(){
-        var xhr = new XMLHttpRequest();
-        xhr.open('POST', '/start_apply.htm', true);
-        xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-        xhr.send(
-            'action_mode=+Apply+' +
-            '&action_script=%2Fsbin%2Frestart_udp2raw' +
-            '&current_page=Advanced_udp2raw.asp' +
-            '&next_page=Advanced_udp2raw.asp' +
-            '&sid_list='
-        );
-    }, 1500);
-
-    setTimeout(function(){ window.location.href = 'Advanced_udp2raw.asp'; }, 4000);
+    setTimeout(function(){ window.location.href = '/Advanced_udp2raw.asp'; }, 4000);
 }
 
 function done_validating(action){}
@@ -670,31 +530,21 @@ function done_validating(action){}
 </div>
 <br>
 <div id="Loading" class="popup_bg"></div>
-<iframe name="hidden_frame" id="hidden_frame" src="" width="0" height="0"
-    frameborder="0" style="position:absolute;"></iframe>
+<iframe name="hidden_frame" id="hidden_frame" src="" width="0" height="0" frameborder="0" style="position:absolute;"></iframe>
 
-<form method="post" name="form" id="ruleForm"
-    action="/start_apply.htm" target="hidden_frame">
+<form method="post" name="form" id="ruleForm" action="/start_apply.htm" target="hidden_frame">
 <input type="hidden" name="current_page"  value="Advanced_udp2raw.asp">
 <input type="hidden" name="next_page"     value="Advanced_udp2raw.asp">
 <input type="hidden" name="next_host"     value="">
 <input type="hidden" name="sid_list"      value="">
 <input type="hidden" name="group_id"      value="">
 <input type="hidden" name="action_mode"   value="">
-<input type="hidden" name="action_script" value="/sbin/restart_udp2raw">
+<input type="hidden" name="action_script" value="restart_udp2raw">
 <input type="hidden" name="flag"          value="">
-
-<!-- v14.0: udp2raw_enable = select выше, id для JS -->
-<input type="hidden" id="udp2raw_enable_val"
-    value="<% nvram_get_x("", "udp2raw_enable"); %>">
-
-<!-- Серверы: пустой hidden для submit, _stored только для чтения -->
+<input type="hidden" id="udp2raw_enable_val" value="<% nvram_get_x("", "udp2raw_enable"); %>">
 <input type="hidden" name="udp2raw_servers" id="udp2raw_servers_submit" value="">
-<!-- Алиас для load_servers() -->
-<input type="hidden" id="udp2raw_servers_stored"
-    value="<% nvram_get_x("", "udp2raw_servers"); %>">
-<input type="hidden" name="udp2raw_loglevel" id="udp2raw_loglevel_val"
-    value="<% nvram_get_x("", "udp2raw_loglevel"); %>">
+<input type="hidden" id="udp2raw_servers_stored" value="<% nvram_get_x("", "udp2raw_servers"); %>">
+<input type="hidden" name="udp2raw_loglevel" id="udp2raw_loglevel_val" value="<% nvram_get_x("", "udp2raw_loglevel"); %>">
 
 <div class="container-fluid"><div class="row-fluid">
   <div class="span3">
@@ -710,10 +560,10 @@ function done_validating(action){}
       <div class="round_bottom">
 
         <div class="alert alert-info" style="margin:10px;">
-          <b>Как работает:</b> OpenVPN → 127.0.0.1:3333 → udp2raw (faketcp) → сервер<br>
+          <b>Как работает:</b> OpenVPN &rarr; 127.0.0.1:3333 &rarr; udp2raw (faketcp) &rarr; сервер<br>
           DPI видит обычный TCP. Туннель стартует автоматически при поднятии WAN.<br>
           <b>VPN клиент:</b> <a href="/vpncli.asp">Настройки</a>
-          → Удалённый сервер: <b>127.0.0.1</b>, порт: <b>3333</b>, транспорт: <b>UDP</b>
+          &rarr; Удалённый сервер: <b>127.0.0.1</b>, порт: <b>3333</b>, транспорт: <b>UDP</b>
         </div>
 
         <div class="status-box">
@@ -725,9 +575,7 @@ function done_validating(action){}
           <tr>
             <th width="50%" style="border-top:0 none;">Включить udp2raw туннель</th>
             <td style="border-top:0 none;">
-              <!-- v14.0: SELECT вместо CSS checkbox — гарантированно сохраняется в POST -->
-              <select name="udp2raw_enable" id="udp2raw_enable_sel" class="span3"
-                  onchange="onEnableChange(this.value);">
+              <select name="udp2raw_enable" id="udp2raw_enable_sel" class="span3" onchange="onEnableChange(this.value);">
                 <option value="0">OFF</option>
                 <option value="1">ON</option>
               </select>
@@ -738,24 +586,16 @@ function done_validating(action){}
         <div id="cfg_main" style="display:none;">
         <table class="table">
           <tr><th colspan="2" style="background:#E3E3E3;">Список серверов</th></tr>
-          <tr>
-            <td colspan="2">
-              <textarea id="srv_text" rows="6" wrap="off" spellcheck="false"
-                class="span12"
+          <tr><td colspan="2">
+              <textarea id="srv_text" rows="6" wrap="off" spellcheck="false" class="span12"
                 style="font-family:'Courier New';font-size:12px;"
-                placeholder="89.39.70.30:4096:millenium2026&#10;server2.example.com:4096:millenium2026&#10;185.x.x.x:4096:millenium2026"></textarea>
-              <div class="help-text">
-                Формат: ХОСТ:ПОРТ:ПАРОЛЬ — домены или IP, один на строку.<br>
-                При недоступности первого — автоматически переключается на следующий.<br>
-                Пароль — это ключ udp2raw (-k), не пароль OpenVPN.
-              </div>
-            </td>
-          </tr>
+                placeholder="89.39.70.30:4096:millenium2026&#10;server2.example.com:4096:millenium2026"></textarea>
+              <div class="help-text">Формат: ХОСТ:ПОРТ:ПАРОЛЬ, один на строку. Автоматический failover.</div>
+          </td></tr>
           <tr>
-            <th width="50%">Подробное логирование работы сервиса</th>
+            <th width="50%">Подробное логирование</th>
             <td>
-              <select id="udp2raw_loglevel_sel" class="span4"
-                  onchange="document.getElementById('udp2raw_loglevel_val').value=this.value;">
+              <select id="udp2raw_loglevel_sel" class="span4" onchange="document.getElementById('udp2raw_loglevel_val').value=this.value;">
                 <option value="0">Отключено</option>
                 <option value="3">Включено (уровень 3)</option>
                 <option value="5">Максимальное (уровень 5)</option>
@@ -766,18 +606,14 @@ function done_validating(action){}
         </table>
         </div>
 
-        <table class="table">
-          <tr>
+        <table class="table"><tr>
             <td style="border:0 none;text-align:center;">
-              <input type="button" class="btn btn-primary" style="width:219px"
+              <input type="button" id="save_btn" class="btn btn-primary" style="width:219px"
                 onclick="applyRule();" value="Сохранить и применить">
               <div class="help-text" style="text-align:center;margin-top:8px;">
-                Toggle ON/OFF + Сохранить = VPN запустится/остановится немедленно.<br>
-                Статус обновляется каждые 5 сек.
-              </div>
+                Статус обновляется каждые 5 сек.</div>
             </td>
-          </tr>
-        </table>
+        </tr></table>
 
       </div>
     </div>
@@ -789,10 +625,10 @@ function done_validating(action){}
 </body>
 </html>
 ASPEOF
-echo "  Created Advanced_udp2raw.asp v8.0"
+echo "  Created Advanced_udp2raw.asp v15.0"
 
 ############################################################
-# 17. Patch state.js
+# 11. state.js menu
 ############################################################
 echo ">>> [10] state.js menu"
 STATEJS="$WWW/state.js"
@@ -811,19 +647,13 @@ else
 fi
 
 ############################################################
-############################################################
-# 18. nvram defaults (defaults.c)
+# 12. nvram defaults (defaults.c)
 ############################################################
 echo ">>> [11] nvram defaults"
-
 patch_nvram_defaults() {
-    local FILE="$1"
-    local LABEL="$2"
+    local FILE="$1" LABEL="$2"
     [ -f "$FILE" ] || return
-    if grep -q "udp2raw_enable" "$FILE"; then
-        echo "  Already patched ($LABEL): $FILE"
-        return
-    fi
+    grep -q "udp2raw_enable" "$FILE" && { echo "  Already patched ($LABEL)"; return; }
     for TERM in '{ 0, 0 }' '{0, 0}'; do
         if grep -q "$TERM" "$FILE"; then
             LINE=$(grep -n "$TERM" "$FILE" | tail -1 | cut -d: -f1)
@@ -833,163 +663,283 @@ patch_nvram_defaults() {
 \t{ \"udp2raw_status\",   \"\" },\\
 \t{ \"udp2raw_active\",   \"\" },\\
 \t{ \"udp2raw_loglevel\", \"0\" }," "$FILE"
-            echo "  Patched ($LABEL): $FILE"
+            echo "  Patched ($LABEL)"
             return
         fi
     done
-    echo "  WARN: terminator not found in $FILE"
+    echo "  WARN: terminator not found ($LABEL)"
 }
-
 patch_nvram_defaults "$TRUNK/user/shared/defaults.c" "shared/defaults.c"
 
 ############################################################
-# 12. variables.c — НЕ ПАТЧИМ (v8.0 финальное решение)
-#
-# variables.c содержит НЕСКОЛЬКО разных массивов (variables[], events_desc[] и др.)
-# Автопатч вставлял в НЕПРАВИЛЬНЫЙ массив (events_desc) — build failure.
-# variables.c НЕ НУЖЕН: restart_udp2raw получает args напрямую и сам
-# вызывает nvram set. Whitelist httpd не участвует в нашем flow.
+# 13. variables.c — httpd whitelist
 ############################################################
-############################################################
-# 12. variables.c — httpd whitelist
-#
-# КРИТИЧНО для WebUI: Padavan httpd сохраняет POST-поля в nvram
-# ТОЛЬКО если они есть в variables.c. Без этого udp2raw_enable
-# никогда не сохраняется → toggle всегда сбрасывается в OFF.
-#
-# ИСПРАВЛЕНИЕ v8.1: Python с поиском КОНКРЕТНОГО массива
-# struct variable variables[] через отслеживание глубины скобок.
-# НЕ трогает events_desc[] или другие массивы в том же файле.
-############################################################
-echo ">>> [12] variables.c — struct-aware Python patch"
-
+echo ">>> [12] variables.c"
 HTTPD_VARS="$TRUNK/user/httpd/variables.c"
-
 if [ ! -f "$HTTPD_VARS" ]; then
-    echo "  WARN: variables.c not found, skip"
+    echo "  WARN: variables.c not found"
 else
-    # v14.0 FIX: пишем Python в файл — нет проблем с экранированием кавычек
     cat > /tmp/patch_udp2raw_vars.py << 'PATCHPY'
 import re, sys
-
 FILE = sys.argv[1]
 NEW_VARS = ["udp2raw_enable", "udp2raw_servers", "udp2raw_status", "udp2raw_active", "udp2raw_loglevel"]
-
 with open(FILE) as f:
     content = f.read()
-
 if "udp2raw_enable" in content:
-    print("  Already patched:", FILE)
-    sys.exit(0)
-
+    print("  Already patched:", FILE); sys.exit(0)
 print("  Patching:", FILE)
-
-# Найти struct variable variables[]
 m = re.search(r'struct\s+variable\s+\w+\s*\[\s*\]\s*=\s*\{', content)
 if not m:
     m = re.search(r'\bvariables\s*\[\s*\]\s*=\s*\{', content)
 if not m:
-    print("  ERROR: variables array not found")
-    sys.exit(1)
-
+    print("  ERROR: variables array not found"); sys.exit(1)
 arr_open = m.end() - 1
-
-# Найти закрывающую скобку массива
-depth = 0
-arr_close = None
+depth = 0; arr_close = None
 for i in range(arr_open, len(content)):
     if content[i] == '{': depth += 1
     elif content[i] == '}':
         depth -= 1
-        if depth == 0:
-            arr_close = i
-            break
-
+        if depth == 0: arr_close = i; break
 if arr_close is None:
-    print("  ERROR: closing brace not found")
-    sys.exit(1)
-
-# Определить отступ из первой записи
+    print("  ERROR: closing brace not found"); sys.exit(1)
 arr_body = content[arr_open+1:arr_close]
 ENTRY_RE = re.compile(r'^([\t ]+)\{([^}]+)\}', re.MULTILINE)
 entries = ENTRY_RE.findall(arr_body)
 if not entries:
-    print("  ERROR: no entries found")
-    sys.exit(1)
+    print("  ERROR: no entries found"); sys.exit(1)
 indent = entries[0][0]
-
-# Новые записи: формат {"varname", "varname", NULL, 1}
-# 1 = ненулевые restart bits -> httpd вызовет action_script
 new_entries = ""
 for var in NEW_VARS:
     new_entries += indent + '{"' + var + '", "' + var + '", NULL, 1},\n'
-
-# FIX: вставить ПЕРЕД {NULL,...} терминатором (если есть)
-# Иначе httpd остановится на NULL и не увидит наши переменные
 null_m = re.search(r'(\{NULL\s*,)', content[arr_open:arr_close])
 if null_m:
     insert_pos = arr_open + null_m.start()
-    print("  Inserting BEFORE NULL terminator at offset", insert_pos)
     new_content = content[:insert_pos] + new_entries + content[insert_pos:]
 else:
-    # Нет терминатора — вставить перед закрывающей скобкой
-    print("  No NULL terminator, inserting before closing brace")
     before = content[:arr_close].rstrip('\n\r')
-    if before and not before.endswith(','):
-        before += ','
+    if before and not before.endswith(','): before += ','
     new_content = before + "\n" + new_entries + content[arr_close:]
-
 with open(FILE, 'w') as f:
     f.write(new_content)
-
 print("  SUCCESS")
 PATCHPY
-
     python3 /tmp/patch_udp2raw_vars.py "$HTTPD_VARS"
-    echo "  --- Verify ---"
     grep -n "udp2raw" "$HTTPD_VARS" && echo "  VERIFY OK" || echo "  VERIFY FAILED!"
 fi
 
+############################################################
+# 14. vpnc_cus3 MTU defaults
+############################################################
 echo ">>> [13] MTU defaults (vpnc_cus3)"
-for F in "$TRUNK/user/shared/defaults.c" "$TRUNK/user/httpd/variables.c"; do
+for F in "$TRUNK/user/shared/defaults.c"; do
     [ -f "$F" ] || continue
-    if grep -q "vpnc_cus3.*tun-mtu" "$F"; then
-        echo "  vpnc_cus3 already in: $F"; continue
-    fi
+    grep -q "vpnc_cus3" "$F" && { echo "  vpnc_cus3 already in $F"; continue; }
     for TERM in '{ 0, 0 }' '{0, 0}'; do
         if grep -q "$TERM" "$F"; then
             LINE=$(grep -n "$TERM" "$F" | tail -1 | cut -d: -f1)
             sed -i "${LINE}i\\
 \t{ \"vpnc_cus3\", \"tun-mtu 1300\\\\nmssfix 1260\" }," "$F"
-            echo "  Added vpnc_cus3 to: $F"
+            echo "  Added vpnc_cus3 to $F"
             break
         fi
     done
 done
 
 ############################################################
+# 15. ★ КЛЮЧЕВОЙ ФИКС v15.0 ★
+#     Патч rc.c — регистрация restart_udp2raw как сервиса
+#
+#     httpd → notify_rc("restart_udp2raw") → rc демон
+#     rc ищет "restart_udp2raw" в handle_notifications()
+#     Без этой записи rc молча игнорирует вызов.
+#
+#     Вставляем рядом с restart_zapret (тот же паттерн).
+############################################################
+echo ">>> [14] ★ rc.c — register restart_udp2raw service"
+
+cat > /tmp/patch_rc_udp2raw.py << 'RCPY'
+import sys, re
+
+# Ищем rc.c в нескольких возможных путях
+import glob
+candidates = glob.glob("padavan-ng/trunk/user/rc/rc.c") + \
+             glob.glob("padavan-ng/trunk/user/rc/services*.c") + \
+             glob.glob("padavan-ng/trunk/user/rc/notify*.c")
+
+# Ищем файл, в котором есть "restart_zapret"
+target = None
+for f in candidates:
+    try:
+        with open(f) as fh:
+            if "restart_zapret" in fh.read():
+                target = f
+                break
+    except:
+        pass
+
+if not target:
+    # Fallback: ищем рекурсивно
+    import os
+    for root, dirs, files in os.walk("padavan-ng/trunk/user/rc"):
+        for fn in files:
+            if fn.endswith('.c'):
+                fp = os.path.join(root, fn)
+                try:
+                    with open(fp) as fh:
+                        if "restart_zapret" in fh.read():
+                            target = fp
+                            break
+                except:
+                    pass
+        if target:
+            break
+
+if not target:
+    print("  ERROR: cannot find source file with restart_zapret handler")
+    sys.exit(1)
+
+print(f"  Found: {target}")
+
+with open(target) as f:
+    content = f.read()
+
+if "restart_udp2raw" in content:
+    print("  Already patched")
+    sys.exit(0)
+
+# Ищем блок restart_zapret и вставляем restart_udp2raw после него
+# Паттерн 1: strcmp с entry->d_name (Padavan-NG стиль)
+# else if (strcmp(entry->d_name, "restart_zapret") == 0)
+# {
+#     ...
+# }
+p1 = re.search(
+    r'(else\s+if\s*\(\s*strcmp\s*\(\s*entry->d_name\s*,\s*"restart_zapret"\s*\)\s*==\s*0\s*\)\s*\{[^}]*\})',
+    content, re.DOTALL
+)
+
+# Паттерн 2: strcmp с script_name или просто строкой
+p2 = re.search(
+    r'(else\s+if\s*\(\s*strcmp\s*\([^,]*,\s*"restart_zapret"\s*\)\s*==\s*0\s*\)\s*\{[^}]*\})',
+    content, re.DOTALL
+)
+
+# Паттерн 3: strstr вместо strcmp
+p3 = re.search(
+    r'(else\s+if\s*\(\s*strstr\s*\([^,]*,\s*"restart_zapret"\s*\)[^{]*\{[^}]*\})',
+    content, re.DOTALL
+)
+
+match = p1 or p2 or p3
+
+if not match:
+    # Паттерн 4: просто найти строку "restart_zapret" и ближайший закрывающий }
+    idx = content.find('"restart_zapret"')
+    if idx == -1:
+        print("  ERROR: restart_zapret string not found")
+        sys.exit(1)
+    # Найти закрывающую } этого блока
+    brace_count = 0
+    start = content.rfind('\n', 0, idx)  # начало строки
+    # Ищем начало блока (else if)
+    block_start = content.rfind('else', 0, idx)
+    if block_start == -1:
+        block_start = start
+    # Ищем конец блока
+    i = idx
+    found_open = False
+    while i < len(content):
+        if content[i] == '{':
+            brace_count += 1
+            found_open = True
+        elif content[i] == '}':
+            brace_count -= 1
+            if found_open and brace_count == 0:
+                insert_pos = i + 1
+                break
+        i += 1
+    else:
+        print("  ERROR: could not find block end")
+        sys.exit(1)
+else:
+    insert_pos = match.end()
+
+# Определяем формат (какая переменная используется в strcmp)
+if p1:
+    varname = "entry->d_name"
+elif p2:
+    # Извлекаем имя переменной из strcmp
+    m = re.search(r'strcmp\s*\(\s*([^,]+),', p2.group())
+    varname = m.group(1).strip() if m else "entry->d_name"
+elif p3:
+    m = re.search(r'strstr\s*\(\s*([^,]+),', p3.group())
+    varname = m.group(1).strip() if m else "entry->d_name"
+else:
+    varname = "entry->d_name"
+
+# Собираем новый блок
+new_block = f"""
+\telse if (strcmp({varname}, "restart_udp2raw") == 0)
+\t{{
+\t\tsystem("/sbin/restart_udp2raw");
+\t}}"""
+
+content = content[:insert_pos] + new_block + content[insert_pos:]
+
+with open(target, 'w') as f:
+    f.write(content)
+
+print(f"  PATCHED: added restart_udp2raw handler after restart_zapret")
+print(f"  Variable: {varname}")
+
+# Verify
+with open(target) as f:
+    v = f.read()
+if "restart_udp2raw" in v:
+    # Show context
+    lines = v.split('\n')
+    for i, line in enumerate(lines):
+        if 'restart_udp2raw' in line:
+            start = max(0, i-1)
+            end = min(len(lines), i+5)
+            for j in range(start, end):
+                print(f"  {j+1}: {lines[j]}")
+            break
+    print("  VERIFY OK")
+else:
+    print("  VERIFY FAILED!")
+    sys.exit(1)
+RCPY
+
+python3 /tmp/patch_rc_udp2raw.py
+RC_RESULT=$?
+
+if [ "$RC_RESULT" -ne 0 ]; then
+    echo "  *** CRITICAL: rc.c patch FAILED ***"
+    echo "  Without this patch, WebUI button will NOT work."
+    exit 1
+fi
+
+############################################################
 echo ""
 echo "============================================"
-echo "  MILLENIUM Group VPN — build ready v14.0"
+echo "  MILLENIUM Group VPN — build ready v15.0"
 echo ""
-echo "  ИСПРАВЛЕНИЕ v14.0:"
-echo "  action_script = 'restart_udp2raw' БЕЗ АРГУМЕНТОВ."
-echo "  httpd Padavan ИГНОРИРОВАЛ скрипт если в строке были пробелы."
-echo "  Теперь httpd сохраняет udp2raw_enable + udp2raw_servers"
-echo "  в nvram через variables.c whitelist, затем вызывает скрипт."
-echo "  restart_udp2raw читает enable+servers из nvram."
+echo "  КЛЮЧЕВОЙ ФИКС v15.0:"
+echo "  rc.c пропатчен — restart_udp2raw зарегистрирован"
+echo "  как сервис в handle_notifications()."
+echo "  httpd -> notify_rc -> rc -> /sbin/restart_udp2raw"
+echo "  Штатный механизм Padavan (как restart_zapret)."
 echo "============================================"
 
 echo ""
 echo "=== DIAGNOSTICS ==="
 echo "--- Files ---"
 ls -la "$UDP2RAW_DIR/files/" 2>/dev/null
-echo "--- restart_udp2raw ---"
-cat "$ROMFS_SBIN/restart_udp2raw" 2>/dev/null || echo "NOT FOUND"
-echo "--- WAN hook ---"
-cat "$ROMFS_STORAGE/started_wan_hook.sh" 2>/dev/null || echo "NOT FOUND"
-echo "--- nvram vars in variables.c ---"
-grep "udp2raw_enable\|udp2raw_servers\|vpnc_cus3" \
-    "$TRUNK/user/httpd/variables.c" 2>/dev/null || echo "NOT FOUND"
-ls "$WWW/Advanced_udp2raw.asp" "$WWW/millenium_status.asp" 2>/dev/null && echo "ASP OK"
+echo "--- rc.c patch ---"
+grep -n "restart_udp2raw" "$TRUNK"/user/rc/*.c 2>/dev/null || echo "NOT FOUND in rc/*.c"
+echo "--- variables.c ---"
+grep "udp2raw_enable" "$TRUNK/user/httpd/variables.c" 2>/dev/null || echo "NOT FOUND"
+echo "--- ASP ---"
+grep "action_script" "$WWW/Advanced_udp2raw.asp" 2>/dev/null | head -3
 echo "=== END ==="
