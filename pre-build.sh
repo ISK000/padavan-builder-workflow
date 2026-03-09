@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v12.0
+# MILLENIUM Group — Padavan-NG pre-build v13.0
 #
 # ROOT CAUSE HISTORY:
 #  v5-v6: variables.c не патчился (break в цикле). httpd
@@ -36,7 +36,7 @@ ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
 ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v12.0"
+echo "  MILLENIUM Group VPN — pre-build v13.0"
 echo "  FIX: action_script без аргументов, httpd сохраняет nvram"
 echo "============================================"
 
@@ -518,44 +518,7 @@ cat > "$WWW/Advanced_udp2raw.asp" << 'ASPEOF'
 <script type="text/javascript" src="/general.js"></script>
 <script type="text/javascript" src="/popup.js"></script>
 <style>
-/* ── CSS Toggle (без зависимости от itoggle) ── */
-.mil-switch {
-    position: relative;
-    display: inline-block;
-    width: 60px;
-    height: 30px;
-    vertical-align: middle;
-    cursor: pointer;
-}
-.mil-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
-.mil-slider {
-    position: absolute;
-    top: 0; left: 0; right: 0; bottom: 0;
-    background: #ccc;
-    border-radius: 30px;
-    transition: .3s;
-}
-.mil-slider:before {
-    position: absolute;
-    content: "";
-    height: 22px; width: 22px;
-    left: 4px; top: 4px;
-    background: #fff;
-    border-radius: 50%;
-    transition: .3s;
-    box-shadow: 0 1px 3px rgba(0,0,0,.3);
-}
-.mil-switch input:checked + .mil-slider { background: #5cb85c; }
-.mil-switch input:checked + .mil-slider:before { transform: translateX(30px); }
-.mil-toggle-label {
-    display: inline-block;
-    margin-left: 10px;
-    font-size: 14px;
-    font-weight: bold;
-    vertical-align: middle;
-    min-width: 36px;
-}
-/* ── Остальные стили ── */
+/* ── Стили ── */
 .help-text  { color: #888; font-size: 11px; margin-top: 3px; }
 .status-box { background: #f5f5f5; border-radius: 6px; padding: 12px 16px; margin: 10px; }
 </style>
@@ -627,36 +590,22 @@ function update_status(){
     }
 }
 
-/* ─────────────────────────────────────────────
-   CSS TOGGLE — FIX v7.0
-   hidden input "udp2raw_enable" — единственный
-   источник правды для формы. Никаких radio buttons,
-   никакого itoggle.
-   ───────────────────────────────────────────── */
+// v13.0: SELECT-based enable (как у zapret)
 function syncToggle(){
-    var val = document.getElementById('udp2raw_enable_val').value;
-    var cb  = document.getElementById('enable_cb');
-    cb.checked = (val === '1');
-    refreshToggleLabel(cb.checked);
+    var val = document.getElementById('udp2raw_enable_val').value || '0';
+    var sel = document.getElementById('udp2raw_enable_sel');
+    if (!sel) return;
+    sel.value = val;
     change_enabled();
 }
 
-function onEnableChange(cb){
-    document.getElementById('udp2raw_enable_val').value = cb.checked ? '1' : '0';
-    refreshToggleLabel(cb.checked);
+function onEnableChange(val){
     change_enabled();
-}
-
-function refreshToggleLabel(checked){
-    var lbl = document.getElementById('toggle_lbl');
-    if (!lbl) return;
-    lbl.innerHTML = checked
-        ? '<span style="color:#3c763d;font-weight:bold">ON</span>'
-        : '<span style="color:#999">OFF</span>';
 }
 
 function change_enabled(){
-    var enabled = document.getElementById('enable_cb').checked;
+    var sel = document.getElementById('udp2raw_enable_sel');
+    var enabled = sel && sel.value === '1';
     showhide_div('cfg_main', enabled);
 }
 
@@ -676,10 +625,7 @@ function syncLogLevel(){
 }
 
 function applyRule(){
-    // v12.0 FIX 1: явно читаем checkbox — не полагаемся на onEnableChange()
-    var cb = document.getElementById('enable_cb');
-    document.getElementById('udp2raw_enable_val').value = cb.checked ? '1' : '0';
-
+    // v13.0: select name="udp2raw_enable" сохраняется автоматически в POST
     var sv = document.getElementById('srv_text').value;
     sv = sv.replace(/\r\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n|\n$/g, '');
     var srvPct = sv.replace(/\n/g, '%');
@@ -693,7 +639,7 @@ function applyRule(){
     if (btn) { btn.value = 'Сохранение...'; btn.disabled = true; }
     document.form.submit();
 
-    // v12.0 FIX 2: второй POST через 1.5с для гарантированного вызова action_script
+    // v13.0 FIX 2: второй POST через 1.5с для гарантированного вызова action_script
     // Не зависит от restart_needed_bits в variables.c вообще.
     setTimeout(function(){
         var xhr = new XMLHttpRequest();
@@ -738,10 +684,8 @@ function done_validating(action){}
 <input type="hidden" name="action_script" value="/sbin/restart_udp2raw">
 <input type="hidden" name="flag"          value="">
 
-<!-- FIX v7.0: HIDDEN INPUT вместо radio buttons.
-     Значение устанавливается JS через onEnableChange().
-     Гарантированно попадает в POST при любом submit. -->
-<input type="hidden" name="udp2raw_enable" id="udp2raw_enable_val"
+<!-- v13.0: udp2raw_enable = select выше, id для JS -->
+<input type="hidden" id="udp2raw_enable_val"
     value="<% nvram_get_x("", "udp2raw_enable"); %>">
 
 <!-- Серверы: пустой hidden для submit, _stored только для чтения -->
@@ -781,13 +725,12 @@ function done_validating(action){}
           <tr>
             <th width="50%" style="border-top:0 none;">Включить udp2raw туннель</th>
             <td style="border-top:0 none;">
-              <!-- CSS TOGGLE v7.0: нет зависимости от itoggle/engage.itoggle -->
-              <label class="mil-switch">
-                <input type="checkbox" id="enable_cb"
-                    onchange="onEnableChange(this)">
-                <span class="mil-slider"></span>
-              </label>
-              <span id="toggle_lbl" class="mil-toggle-label"></span>
+              <!-- v13.0: SELECT вместо CSS checkbox — гарантированно сохраняется в POST -->
+              <select name="udp2raw_enable" id="udp2raw_enable_sel" class="span3"
+                  onchange="onEnableChange(this.value);">
+                <option value="0">OFF</option>
+                <option value="1">ON</option>
+              </select>
             </td>
           </tr>
         </table>
@@ -925,143 +868,129 @@ HTTPD_VARS="$TRUNK/user/httpd/variables.c"
 if [ ! -f "$HTTPD_VARS" ]; then
     echo "  WARN: variables.c not found, skip"
 else
-python3 - "$HTTPD_VARS" << 'PYEOF'
+    # v13.0 FIX: пишем Python в файл — нет проблем с экранированием кавычек
+    cat > /tmp/patch_udp2raw_vars.py << 'PATCHPY'
 import re, sys
 
 FILE = sys.argv[1]
 NEW_VARS = ["udp2raw_enable", "udp2raw_servers", "udp2raw_status", "udp2raw_active", "udp2raw_loglevel"]
-NEW_DEFS = {"udp2raw_enable": "0", "udp2raw_servers": "", "udp2raw_status": "", "udp2raw_active": "", "udp2raw_loglevel": "0"}
+NEW_DEFS = {
+    "udp2raw_enable":  "0",
+    "udp2raw_servers": "",
+    "udp2raw_status":  "",
+    "udp2raw_active":  "",
+    "udp2raw_loglevel":"0",
+}
 
-with open(FILE, 'r') as f:
+with open(FILE) as f:
     content = f.read()
 
-if 'udp2raw_enable' in content:
+if "udp2raw_enable" in content:
     print("  Already patched:", FILE)
     sys.exit(0)
 
 print("  Patching:", FILE)
 
-# 1. Find struct variable variables[] = { SPECIFICALLY
+# Найти struct variable variables[]
 m = re.search(r'struct\s+variable\s+\w+\s*\[\s*\]\s*=\s*\{', content)
 if not m:
-    print("  ERROR: 'struct variable ... [] = {' not found")
-    print("  Trying fallback: 'variables[] ='")
     m = re.search(r'\bvariables\s*\[\s*\]\s*=\s*\{', content)
-    if not m:
-        print("  ERROR: no variables array found")
-        sys.exit(1)
+if not m:
+    print("  ERROR: variables array not found")
+    sys.exit(1)
 
-arr_open = m.end() - 1  # position of opening {
-print(f"  Array declaration: {repr(content[m.start():m.end()])}")
-print(f"  Opening brace at offset {arr_open}")
+arr_open = m.end() - 1
+print("  Array at offset:", arr_open)
 
-# 2. Track brace depth to find EXACT closing brace of THIS array
-# This way we NEVER cross into events_desc[] or any other array
+# Найти закрывающую скобку массива через подсчёт глубины
 depth = 0
 arr_close = None
 for i in range(arr_open, len(content)):
-    c = content[i]
-    if c == '{':
+    if content[i] == '{':
         depth += 1
-    elif c == '}':
+    elif content[i] == '}':
         depth -= 1
         if depth == 0:
             arr_close = i
             break
 
 if arr_close is None:
-    print("  ERROR: matching closing brace not found")
+    print("  ERROR: closing brace not found")
     sys.exit(1)
 
-print(f"  Array: offset {arr_open} to {arr_close} ({arr_close - arr_open} chars)")
-
-# 3. Detect entry format from entries INSIDE this array ONLY
+# Определить формат записей внутри массива
 arr_body = content[arr_open+1:arr_close]
-ENTRY_RE = re.compile(r'^([\t ]+)\{([ \t]*"[^"]*"[^}]*)\}', re.MULTILINE)
+ENTRY_RE = re.compile(r'^([\t ]+)\{([^}]+)\}', re.MULTILINE)
 entries = ENTRY_RE.findall(arr_body)
 
 if not entries:
-    print("  ERROR: no string-keyed entries found inside variables[] array")
-    print("  Array body (first 200):", repr(arr_body[:200]))
+    print("  ERROR: no entries found in array")
     sys.exit(1)
 
 sample_indent = entries[0][0]
 sample_body   = entries[0][1].strip()
 
+# Разбить на поля (учитывать строки в кавычках)
 def split_fields(s):
     fields, cur, in_q = [], '', False
     for c in s:
-        if c == '"': in_q = not in_q
+        if c == '"':
+            in_q = not in_q
         if c == ',' and not in_q:
-            fields.append(cur.strip()); cur = ''
+            fields.append(cur.strip())
+            cur = ''
         else:
             cur += c
-    if cur.strip(): fields.append(cur.strip())
+    if cur.strip():
+        fields.append(cur.strip())
     return fields
 
-sample_fields = split_fields(sample_body)
-n_fields = len(sample_fields)
-print(f"  Sample: {repr(sample_body[:60])} -> {n_fields} fields")
+fields = split_fields(sample_body)
+n = len(fields)
+print("  Fields:", n, "sample:", repr(sample_body[:60]))
 
-# v12.0: УМНЫЙ ДЕТЕКТ ФОРМАТА variables.c
-# Padavan 3.4.x format:  {"ServiceID", "varname", validate_fn, flags}
-# Padavan old format:    {"varname", "default", validate_fn, flags}
-#
-# Ключевое отличие: если ОБА первых поля — quoted strings → 4-field с service_id
-def is_quoted(s): return s.startswith(\'"\') and s.endswith(\'"\')
+# v13 FIX: restart_needed_bits = 1 ВСЕГДА
+# Формат A (3+ полей, первое — строка в кавычках): {"varname", fn, flags}
+# Формат B (4+ полей, первые два — строки): {"ServiceID", "varname", fn, flags}
+def is_str(f):
+    return f.startswith('"') and f.endswith('"')
 
-if n_fields >= 2 and is_quoted(sample_fields[0]) and is_quoted(sample_fields[1]):
-    # 4-field format: {"ServiceID", "varname", validate_fn, flags}
-    # Нужно вставить: {"ServiceID", "udp2raw_enable", NULL, 1}
-    service_id = sample_fields[0].strip(\'"\')
-    print(f"  Detected 4-field format, ServiceID={repr(service_id)}")
-
-    def make_entry(varname, default):
-        # NULL validate, flags=1 чтобы httpd вызвал action_script
-        return f\'{sample_indent}{{"{service_id}", "{varname}", NULL, 1}},\'
-
+if n >= 4 and is_str(fields[0]) and is_str(fields[1]):
+    # 4-field: {"ServiceID", "varname", validate_fn, flags}
+    svc = fields[0]
+    suffix = ", NULL, 1"
+    def make(var, dflt):
+        return sample_indent + '{"' + svc.strip('"') + '", "' + var + '"' + suffix + '},'
+    print("  Format: 4-field, ServiceID=" + svc)
+elif n >= 3 and is_str(fields[0]):
+    # 3-field: {"varname", validate_fn, flags}
+    suffix = ", NULL, 1"
+    def make(var, dflt):
+        return sample_indent + '{"' + var + '"' + suffix + '},'
+    print("  Format: 3-field")
 else:
-    # 2-field format: {"varname", validate_fn, flags}  or {"varname", "default", fn, flags}
-    # Вставляем с flags=1
-    print(f"  Detected 2-field format")
-    # Определяем суффикс по образцу, заменяем последний флаг на 1
-    extra_fields = sample_fields[2:] if n_fields > 2 else []
-    safe_extras = [
-        f if re.match(r\'^(0|-?[0-9]+|NULL|FALSE|TRUE|[A-Z_][A-Z0-9_]*)$\', f) else \'NULL\'
-        for f in extra_fields
-    ]
-    # Устанавливаем restart flags = 1 (последнее числовое поле)
-    for i in range(len(safe_extras)-1, -1, -1):
-        if re.match(r\'^(0|[0-9]+|FALSE|TRUE)$\', safe_extras[i]):
-            safe_extras[i] = \'1\'
-            break
-    else:
-        safe_extras.append(\'1\')
-    extra_str = \', \' + \', \'.join(safe_extras) if safe_extras else \'\' 
-    print(f"  Extra suffix: {repr(extra_str)}")
+    # 2-field fallback: {"varname", "default"}
+    def make(var, dflt):
+        return sample_indent + '{"' + var + '", "' + dflt + '"},'
+    print("  Format: 2-field (fallback)")
 
-    def make_entry(varname, default):
-        return f\'{sample_indent}{{"{varname}", "{default}"{extra_str}}},'
+new_entries = "\n".join(make(v, NEW_DEFS[v]) for v in NEW_VARS) + "\n"
+print("  New entries:\n" + new_entries)
 
-new_block = \'\\n\'.join(make_entry(v, NEW_DEFS[v]) for v in NEW_VARS) + \'\\n\'
-print(f"  New entries:\\n{new_block}")
-
-# 4. Insert just before arr_close, ensuring trailing comma on last existing entry
 before = content[:arr_close].rstrip('\n\r')
 if before and not before.endswith(','):
     before += ','
-    print("  Added trailing comma to last existing entry")
 
-new_content = before + '\n' + new_block + content[arr_close:]
-
+new_content = before + "\n" + new_entries + content[arr_close:]
 with open(FILE, 'w') as f:
     f.write(new_content)
 
-print("  SUCCESS: variables.c patched (inside struct variable[] only)")
-PYEOF
+print("  SUCCESS")
+PATCHPY
 
-echo "  --- Verify ---"
-grep -n "udp2raw" "$HTTPD_VARS" && echo "  VERIFY OK" || echo "  VERIFY FAILED!"
+    python3 /tmp/patch_udp2raw_vars.py "$HTTPD_VARS"
+    echo "  --- Verify ---"
+    grep -n "udp2raw" "$HTTPD_VARS" && echo "  VERIFY OK" || echo "  VERIFY FAILED!"
 fi
 
 echo ">>> [13] MTU defaults (vpnc_cus3)"
@@ -1084,9 +1013,9 @@ done
 ############################################################
 echo ""
 echo "============================================"
-echo "  MILLENIUM Group VPN — build ready v8.0"
+echo "  MILLENIUM Group VPN — build ready v13.0"
 echo ""
-echo "  ИСПРАВЛЕНИЕ v12.0:"
+echo "  ИСПРАВЛЕНИЕ v13.0:"
 echo "  action_script = 'restart_udp2raw' БЕЗ АРГУМЕНТОВ."
 echo "  httpd Padavan ИГНОРИРОВАЛ скрипт если в строке были пробелы."
 echo "  Теперь httpd сохраняет udp2raw_enable + udp2raw_servers"
