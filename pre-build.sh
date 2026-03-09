@@ -746,221 +746,192 @@ for F in "$TRUNK/user/shared/defaults.c"; do
 done
 
 ############################################################
+############################################################
 # 15. ★ КЛЮЧЕВОЙ ФИКС v15.0 ★
 #     Патч rc.c — регистрация restart_udp2raw как сервиса
+#     ЯКОРЬ: строка "rc notification" — это функция обработки уведомлений
 ############################################################
 echo ">>> [14] ★ rc.c — register restart_udp2raw service"
-
-# DEBUG: показать что содержит rc.c
-echo "  --- DEBUG: searching for service handlers in rc/*.c ---"
-for f in "$TRUNK"/user/rc/*.c; do
-    [ -f "$f" ] || continue
-    if grep -q "zapret" "$f" 2>/dev/null; then
-        echo "  ZAPRET found in: $f"
-        grep -n "zapret" "$f" 2>/dev/null | head -10
-    fi
-    # Показать любые restart_ обработчики
-    RESTART_COUNT=$(grep -c "restart_" "$f" 2>/dev/null || echo 0)
-    if [ "$RESTART_COUNT" -gt 5 ]; then
-        echo "  SERVICE HANDLERS in: $f ($RESTART_COUNT restart_ refs)"
-        grep -n "restart_" "$f" 2>/dev/null | tail -10
-    fi
-done
 
 cat > /tmp/patch_rc_udp2raw.py << 'RCPY'
 import sys, re, os, glob
 
-# Step 1: Find ALL .c files with restart_ handlers
 rc_dir = "padavan-ng/trunk/user/rc"
-best_file = None
-best_count = 0
 
-for fn in os.listdir(rc_dir):
+# Step 1: Find the file that contains "rc notification" (the handler function)
+target = None
+for fn in sorted(os.listdir(rc_dir)):
     if not fn.endswith('.c'):
         continue
     fp = os.path.join(rc_dir, fn)
-    try:
-        with open(fp) as fh:
-            txt = fh.read()
-        count = txt.count('restart_')
-        if count > best_count:
-            best_count = count
-            best_file = fp
-        # Also check specifically for zapret
-        if 'zapret' in txt:
-            print(f"  zapret found in {fp}")
-            # Show lines
-            for i, line in enumerate(txt.split('\n')):
-                if 'zapret' in line:
-                    print(f"    {i+1}: {line.rstrip()}")
-    except:
-        pass
+    with open(fp) as fh:
+        txt = fh.read()
+    if 'rc_notification' in txt or 'rc notification' in txt:
+        target = fp
+        break
 
-if not best_file:
-    print("  ERROR: no .c files with restart_ handlers found")
+if not target:
+    print("  ERROR: no file with rc_notification handler")
     sys.exit(1)
 
-print(f"  Best file: {best_file} ({best_count} restart_ refs)")
+print(f"  Target: {target}")
 
-with open(best_file) as f:
+with open(target) as f:
     content = f.read()
+    lines = content.split('\n')
 
 if "restart_udp2raw" in content:
     print("  Already patched")
     sys.exit(0)
 
-lines = content.split('\n')
-
-# Step 2: Find the notification handler - look for patterns
-# Pattern A: strcmp(something, "restart_xxx") == 0
-# Pattern B: macro-based handlers
-# Pattern C: function pointer tables
-
-# Find ALL lines with restart_ in a strcmp/strncmp context
-handler_lines = []
+# Step 2: Find the function that processes rc_notification directory
+# Look for the line with "rc notification" format string or opendir rc_notification
+notify_line = None
 for i, line in enumerate(lines):
-    if 'restart_' in line and ('strcmp' in line or 'strncmp' in line or 'system(' in line):
-        handler_lines.append((i, line))
+    if 'rc_notification' in line and ('opendir' in line or 'readdir' in line or 'notification:' in line or 'rc notification' in line):
+        notify_line = i
+        print(f"  Notification handler ref at line {i+1}: {line.rstrip()}")
 
-print(f"  Handler lines found: {len(handler_lines)}")
-for num, line in handler_lines[-5:]:  # show last 5
-    print(f"    {num+1}: {line.rstrip()}")
+if notify_line is None:
+    # Broader search
+    for i, line in enumerate(lines):
+        if 'rc_notification' in line:
+            notify_line = i
+            print(f"  rc_notification ref at line {i+1}: {line.rstrip()}")
 
-if handler_lines:
-    # Use the LAST handler line as anchor
-    last_handler_line = handler_lines[-1][0]
-    last_handler = handler_lines[-1][1]
-    print(f"  Using last handler at line {last_handler_line+1}")
+if notify_line is None:
+    print("  ERROR: rc_notification not found in source")
+    sys.exit(1)
+
+# Step 3: Find the function boundaries containing this line
+# Walk backwards to find function start
+func_start = None
+for j in range(notify_line, -1, -1):
+    if re.match(r'^(static\s+)?(void|int|char)\s+\w+\s*\(', lines[j]):
+        func_start = j
+        break
+    if re.match(r'^\w+\s+\w+\s*\(', lines[j]) and '{' not in lines[j-1] if j > 0 else True:
+        func_start = j
+        break
+
+if func_start is None:
+    # Just use a wide range around notify_line
+    func_start = max(0, notify_line - 100)
+
+print(f"  Function starts at line {func_start+1}: {lines[func_start].rstrip()}")
+
+# Step 4: Find ALL strcmp/strncmp with "restart_" in this function
+# Scan from func_start to end of function
+handler_lines = []
+brace_depth = 0
+func_end = len(lines) - 1
+in_func = False
+
+for j in range(func_start, len(lines)):
+    for ch in lines[j]:
+        if ch == '{':
+            brace_depth += 1
+            in_func = True
+        elif ch == '}':
+            brace_depth -= 1
+            if in_func and brace_depth == 0:
+                func_end = j
+                break
+    if in_func and brace_depth == 0:
+        break
+    if 'restart_' in lines[j] and ('strcmp' in lines[j] or 'strncmp' in lines[j]):
+        handler_lines.append((j, lines[j]))
+
+print(f"  Function ends at line {func_end+1}")
+print(f"  Handler strcmp lines in this function: {len(handler_lines)}")
+
+if not handler_lines:
+    # Show what IS in this function for debugging
+    print("  WARNING: No strcmp handler lines found. Showing restart_ lines in function:")
+    for j in range(func_start, func_end+1):
+        if 'restart_' in lines[j]:
+            print(f"    {j+1}: {lines[j].rstrip()}")
     
-    # Determine variable name from strcmp
-    varname = "entry->d_name"
-    var_m = re.search(r'str[n]?cmp\s*\(\s*([^,]+),', last_handler)
+    # Try finding system() calls with restart_ in the function
+    for j in range(func_start, func_end+1):
+        if 'restart_' in lines[j] and 'system' in lines[j]:
+            handler_lines.append((j, lines[j]))
+    
+    if not handler_lines:
+        # Look for ANY handler pattern - might use different syntax
+        for j in range(func_start, func_end+1):
+            if 'restart_' in lines[j] and ('==' in lines[j] or 'strcmp' in lines[j] or 'match' in lines[j]):
+                handler_lines.append((j, lines[j]))
+
+if not handler_lines:
+    print("  ERROR: No handler lines found in notification function")
+    print(f"  Dumping function lines {func_start+1}-{func_end+1}:")
+    for j in range(func_start, min(func_end+1, func_start+80)):
+        print(f"    {j+1}: {lines[j].rstrip()}")
+    sys.exit(1)
+
+for num, line in handler_lines[-3:]:
+    print(f"  Handler: {num+1}: {line.rstrip()}")
+
+# Step 5: Insert after the LAST handler in this function
+last_handler_line = handler_lines[-1][0]
+print(f"  Inserting after handler at line {last_handler_line+1}")
+
+# Determine variable name
+varname = "entry->d_name"
+for num, line in handler_lines:
+    var_m = re.search(r'str[n]?cmp\s*\(\s*([^,]+),', line)
     if var_m:
         varname = var_m.group(1).strip()
-    print(f"  Variable: {varname}")
-    
-    # Find end of this handler's block (closing brace)
-    brace_depth = 0
-    found_open = False
-    end_line = last_handler_line
-    for j in range(last_handler_line, min(last_handler_line + 30, len(lines))):
-        for ch in lines[j]:
-            if ch == '{':
-                brace_depth += 1
-                found_open = True
-            elif ch == '}':
-                brace_depth -= 1
-                if found_open and brace_depth == 0:
-                    end_line = j
-                    break
-        if found_open and brace_depth == 0:
-            break
-    
-    print(f"  Block ends at line {end_line+1}: {lines[end_line].rstrip()}")
-    
-    # Detect indent
-    indent = '\t'
-    m = re.match(r'^(\s+)', last_handler)
-    if m:
-        indent = m.group(1)
-    
-    # Insert after end_line
-    new_lines = [
-        f'{indent}else if (strcmp({varname}, "restart_udp2raw") == 0)',
-        f'{indent}{{',
-        f'{indent}\tsystem("/sbin/restart_udp2raw");',
-        f'{indent}}}',
-    ]
-    
-    for idx, nl in enumerate(new_lines):
-        lines.insert(end_line + 1 + idx, nl)
-    
-else:
-    # Fallback: find ANY function that handles notifications
-    # Look for handle_notifications or notify pattern
-    print("  No strcmp handler lines found, trying fallback...")
-    
-    # Look for the function that contains most restart_ references
-    func_start = None
-    for i, line in enumerate(lines):
-        if 'restart_' in line:
-            # Walk backwards to find function definition
-            for j in range(i, max(0, i-50), -1):
-                if re.match(r'^(static\s+)?(void|int)\s+\w+\s*\(', lines[j]):
-                    func_start = j
-                    break
-            if func_start:
+        break
+
+print(f"  Variable: {varname}")
+
+# Find end of the last handler's block
+bd = 0
+fo = False
+end_line = last_handler_line
+for j in range(last_handler_line, min(last_handler_line + 20, len(lines))):
+    for ch in lines[j]:
+        if ch == '{': bd += 1; fo = True
+        elif ch == '}':
+            bd -= 1
+            if fo and bd == 0:
+                end_line = j
                 break
-    
-    if not func_start:
-        print("  ERROR: cannot find any notification handler function")
-        # Last resort: dump first 20 lines with restart_
-        for i, line in enumerate(lines):
-            if 'restart_' in line:
-                print(f"    {i+1}: {line.rstrip()}")
-                if i > 20:
-                    break
-        sys.exit(1)
-    
-    print(f"  Found function at line {func_start+1}: {lines[func_start].rstrip()}")
-    
-    # Find the last closing brace of this function
-    # Find the last restart_ reference in this function
-    last_restart = func_start
-    brace_depth = 0
-    func_end = None
-    for j in range(func_start, len(lines)):
-        if 'restart_' in lines[j]:
-            last_restart = j
-        for ch in lines[j]:
-            if ch == '{': brace_depth += 1
-            elif ch == '}':
-                brace_depth -= 1
-                if brace_depth == 0:
-                    func_end = j
-                    break
-        if func_end:
-            break
-    
-    # Insert before function end, after last restart_ block
-    end_line = last_restart
-    # Find end of block after last_restart
-    bd = 0
-    fo = False
-    for j in range(last_restart, min(last_restart+20, len(lines))):
-        for ch in lines[j]:
-            if ch == '{': bd += 1; fo = True
-            elif ch == '}':
-                bd -= 1
-                if fo and bd == 0:
-                    end_line = j
-                    break
-        if fo and bd == 0:
-            break
-    
-    new_lines = [
-        '\telse if (strcmp(entry->d_name, "restart_udp2raw") == 0)',
-        '\t{',
-        '\t\tsystem("/sbin/restart_udp2raw");',
-        '\t}',
-    ]
-    
-    for idx, nl in enumerate(new_lines):
-        lines.insert(end_line + 1 + idx, nl)
+    if fo and bd == 0:
+        break
+
+print(f"  Block ends at line {end_line+1}: {lines[end_line].rstrip()}")
+
+# Detect indent
+indent = '\t\t'
+m = re.match(r'^(\s+)', handler_lines[-1][1])
+if m:
+    indent = m.group(1)
+
+new_lines = [
+    f'{indent}else if (strcmp({varname}, "restart_udp2raw") == 0)',
+    f'{indent}{{',
+    f'{indent}\tsystem("/sbin/restart_udp2raw");',
+    f'{indent}}}',
+]
+
+for idx, nl in enumerate(new_lines):
+    lines.insert(end_line + 1 + idx, nl)
 
 content = '\n'.join(lines)
-
-with open(best_file, 'w') as f:
+with open(target, 'w') as f:
     f.write(content)
 
 # Verify
-with open(best_file) as f:
+with open(target) as f:
     v = f.read()
 if "restart_udp2raw" in v:
     vlines = v.split('\n')
     for i, line in enumerate(vlines):
         if 'restart_udp2raw' in line:
-            for j in range(max(0,i-2), min(len(vlines),i+6)):
+            for j in range(max(0,i-3), min(len(vlines),i+7)):
                 print(f"  {j+1}: {vlines[j]}")
             break
     print("  VERIFY OK")
