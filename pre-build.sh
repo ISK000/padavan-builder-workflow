@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v20.0
+# MILLENIUM Group — Padavan-NG pre-build v21.0
 #
 # Основано на v16.2. Исправлены 3 бага:
 # БАГ 1: Race condition → START_LOCK берётся ДО fork
@@ -16,8 +16,8 @@ ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
 ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v20.0"
-echo "  FIX: watchdog &; syntax + stale lock cleanup"
+echo "  MILLENIUM Group VPN — pre-build v21.0"
+echo "  FIX: убран lock_take START_LOCK из restart (deadlock)"
 echo "============================================"
 
 ############################################################
@@ -94,7 +94,7 @@ lock_release() { rm -f "$1"; }
 CMEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-common"
 
-# ─── udp2raw-save — v20.0: НЕ вызывает restart в конце ───
+# ─── udp2raw-save — v21.0: НЕ вызывает restart в конце ───
 cat > "$UDP2RAW_DIR/files/udp2raw-save" << 'SAVEOF'
 #!/bin/sh
 CFG="/etc/storage/udp2raw.conf"
@@ -131,7 +131,7 @@ HOOK
 chmod +x "$POSTWAN"
 fi
 /sbin/mtd_storage.sh save >/dev/null 2>&1 || true
-# v20.0 FIX: НЕ вызываем restart_udp2raw — AJAX сделает это отдельным запросом
+# v21.0 FIX: НЕ вызываем restart_udp2raw — AJAX сделает это отдельным запросом
 echo "OK"
 SAVEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-save"
@@ -183,12 +183,12 @@ esac
 CTLEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-ctl"
 
-# ─── fl-vpn-start — v20.0: lock СРАЗУ + проверка PID ───
+# ─── fl-vpn-start — v21.0: lock СРАЗУ + проверка PID ───
 cat > "$UDP2RAW_DIR/files/fl-vpn-start" << 'VPNEOF'
 #!/bin/sh
 . /usr/bin/udp2raw-common
 LOG="/tmp/fl-vpn.log"
-# v20.0: Очищаем stale lock если процесс мёртв
+# v21.0: Очищаем stale lock если процесс мёртв
 if [ -f "$START_LOCK" ]; then
     _lpid=$(cat "$START_LOCK" 2>/dev/null)
     if [ -n "$_lpid" ] && ! kill -0 "$_lpid" 2>/dev/null; then
@@ -230,7 +230,7 @@ while IFS='' read -r line; do
     [ "$SIP" = "$S" ] || echo "  resolved: $S -> $SIP"
     printf "SRV=%s\nPRT=%s\nKEY=%s\n" "$SIP" "$P" "$K" > /tmp/udp2raw_srv
     /usr/bin/udp2raw-ctl start || { echo "  start failed"; IDX=$((IDX+1)); continue; }
-    # v20.0 FIX: проверяем PID реально жив (bind error = падает через ~1с)
+    # v21.0 FIX: проверяем PID реально жив (bind error = падает через ~1с)
     UPID=$(cat /var/run/udp2raw.pid 2>/dev/null)
     if [ -z "$UPID" ] || ! kill -0 "$UPID" 2>/dev/null; then
         echo "  udp2raw died — bind error?"; cat /tmp/udp2raw.log 2>/dev/null | tail -3
@@ -329,7 +329,7 @@ chmod +x "$UDP2RAW_DIR/files/fl-vpn-status"
 echo "  Scripts OK"
 
 ############################################################
-# 5. restart_udp2raw — v20.0: START_LOCK ДО fork
+# 5. restart_udp2raw — v21.0: START_LOCK ДО fork
 ############################################################
 echo ">>> [5] restart_udp2raw"
 mkdir -p "$ROMFS_SBIN"
@@ -347,16 +347,9 @@ cfg_load; nvram_sync
 echo "  EN=$UDP2RAW_ENABLE"
 if [ "$UDP2RAW_ENABLE" = "1" ]; then
     echo "  -> fl-vpn-start"
-    # v20.0 FIX: берём START_LOCK ДО fork
-    # watchdog стартует через ~6мс после fork — без этого lock'а
-    # он видит нет-lock+нет-udp2raw и запускает второй fl-vpn-start
-    # = двойной udp2raw = socket bind error
-    lock_take "$START_LOCK"
+    # v21.0 FIX: НЕ берём START_LOCK здесь — fl-vpn-start управляет своим lock'ом
+    # Запускаем в фоне; watchdog стартует через sleep 2 — fl-vpn-start уже держит lock
     /usr/bin/fl-vpn-start &
-    # Ждём пока fl-vpn-start возьмёт свой lock
-    sleep 1
-    # Освобождаем наш lock — fl-vpn-start уже держит свой
-    lock_release "$START_LOCK"
 else
     echo "  -> fl-vpn-stop"
     /usr/bin/fl-vpn-stop
@@ -664,7 +657,7 @@ function done_validating(action){}
 </body>
 </html>
 ASPEOF
-echo "  Created Advanced_udp2raw.asp v20.0"
+echo "  Created Advanced_udp2raw.asp v21.0"
 
 ############################################################
 # 11. state.js
@@ -853,7 +846,7 @@ fi
 
 echo ""
 echo "============================================"
-echo "  MILLENIUM Group VPN — build ready v20.0"
+echo "  MILLENIUM Group VPN — build ready v21.0"
 echo "  1. START_LOCK берётся ДО fork (нет двойного запуска)"
 echo "  2. PID проверяется после sleep 2 (нет ложного CONNECTED)"
 echo "  3. restart убран из udp2raw-save (нет дублирования)"
