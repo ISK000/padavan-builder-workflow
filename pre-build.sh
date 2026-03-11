@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v17.0
+# MILLENIUM Group — Padavan-NG pre-build v18.0
 #
 # Основано на v16.2. Исправлены 3 бага:
 # БАГ 1: Race condition → START_LOCK берётся ДО fork
@@ -16,8 +16,8 @@ ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
 ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v17.0"
-echo "  FIX: lock before fork + real status check"
+echo "  MILLENIUM Group VPN — pre-build v18.0"
+echo "  FIX: start_apply.htm + variables.c (SystemCmd not available)"
 echo "============================================"
 
 ############################################################
@@ -94,7 +94,7 @@ lock_release() { rm -f "$1"; }
 CMEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-common"
 
-# ─── udp2raw-save — v17.0: НЕ вызывает restart в конце ───
+# ─── udp2raw-save — v18.0: НЕ вызывает restart в конце ───
 cat > "$UDP2RAW_DIR/files/udp2raw-save" << 'SAVEOF'
 #!/bin/sh
 CFG="/etc/storage/udp2raw.conf"
@@ -131,7 +131,7 @@ HOOK
 chmod +x "$POSTWAN"
 fi
 /sbin/mtd_storage.sh save >/dev/null 2>&1 || true
-# v17.0 FIX: НЕ вызываем restart_udp2raw — AJAX сделает это отдельным запросом
+# v18.0 FIX: НЕ вызываем restart_udp2raw — AJAX сделает это отдельным запросом
 echo "OK"
 SAVEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-save"
@@ -183,7 +183,7 @@ esac
 CTLEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-ctl"
 
-# ─── fl-vpn-start — v17.0: lock СРАЗУ + проверка PID ───
+# ─── fl-vpn-start — v18.0: lock СРАЗУ + проверка PID ───
 cat > "$UDP2RAW_DIR/files/fl-vpn-start" << 'VPNEOF'
 #!/bin/sh
 . /usr/bin/udp2raw-common
@@ -191,7 +191,7 @@ LOG="/tmp/fl-vpn.log"
 if lock_is_running "$START_LOCK"; then
     echo "fl-vpn-start already running"; exit 0
 fi
-# v17.0 FIX: берём lock СРАЗУ до любой работы
+# v18.0 FIX: берём lock СРАЗУ до любой работы
 lock_take "$START_LOCK"
 trap 'lock_release "$START_LOCK"' EXIT INT TERM
 exec >> "$LOG" 2>&1
@@ -223,7 +223,7 @@ while IFS='' read -r line; do
     [ "$SIP" = "$S" ] || echo "  resolved: $S -> $SIP"
     printf "SRV=%s\nPRT=%s\nKEY=%s\n" "$SIP" "$P" "$K" > /tmp/udp2raw_srv
     /usr/bin/udp2raw-ctl start || { echo "  start failed"; IDX=$((IDX+1)); continue; }
-    # v17.0 FIX: проверяем PID реально жив (bind error = падает через ~1с)
+    # v18.0 FIX: проверяем PID реально жив (bind error = падает через ~1с)
     UPID=$(cat /var/run/udp2raw.pid 2>/dev/null)
     if [ -z "$UPID" ] || ! kill -0 "$UPID" 2>/dev/null; then
         echo "  udp2raw died — bind error?"; cat /tmp/udp2raw.log 2>/dev/null | tail -3
@@ -320,7 +320,7 @@ chmod +x "$UDP2RAW_DIR/files/fl-vpn-status"
 echo "  Scripts OK"
 
 ############################################################
-# 5. restart_udp2raw — v17.0: START_LOCK ДО fork
+# 5. restart_udp2raw — v18.0: START_LOCK ДО fork
 ############################################################
 echo ">>> [5] restart_udp2raw"
 mkdir -p "$ROMFS_SBIN"
@@ -338,7 +338,7 @@ cfg_load; nvram_sync
 echo "  EN=$UDP2RAW_ENABLE"
 if [ "$UDP2RAW_ENABLE" = "1" ]; then
     echo "  -> fl-vpn-start"
-    # v17.0 FIX: берём START_LOCK ДО fork
+    # v18.0 FIX: берём START_LOCK ДО fork
     # watchdog стартует через ~6мс после fork — без этого lock'а
     # он видит нет-lock+нет-udp2raw и запускает второй fl-vpn-start
     # = двойной udp2raw = socket bind error
@@ -531,37 +531,39 @@ function applyRule(){
     var ll = document.getElementById('udp2raw_loglevel_sel').value;
     var compact = sv.replace(/\n/g,'%');
 
-    var btn = document.getElementById('save_btn');
-    var msg = document.getElementById('apply_msg');
-    if (btn){ btn.value='Сохранение...'; btn.disabled=true; }
-    if (msg) msg.innerHTML = 'Сохранение конфига...';
+    // Обновляем hidden поля
+    document.getElementById('udp2raw_enable_val').value = en;
+    document.getElementById('udp2raw_servers_stored').value = compact;
+    document.getElementById('udp2raw_loglevel_val').value = ll;
+
     m_status='CONNECTING...'; m_active=''; update_status();
 
-    // v17.0: шаг 1 — сохранить конфиг (без restart)
-    $j.post('/apply.cgi', {
-        current_page:'Advanced_udp2raw.asp', next_page:'Advanced_udp2raw.asp',
-        action_mode:' SystemCmd ', action_script:'',
-        SystemCmd: '/usr/bin/u2s '+shellEscape(en)+' '+shellEscape(compact)+' '+shellEscape(ll)
-    }).always(function(){
-        if (msg) msg.innerHTML = 'Запуск туннеля...';
-        // шаг 2 — отдельный запуск restart (через 300мс)
-        setTimeout(function(){
-            $j.post('/apply.cgi', {
-                current_page:'Advanced_udp2raw.asp', next_page:'Advanced_udp2raw.asp',
-                action_mode:' SystemCmd ', action_script:'',
-                SystemCmd: '/sbin/restart_udp2raw'
-            }).always(function(){
-                document.getElementById('udp2raw_enable_val').value = en;
-                document.getElementById('udp2raw_servers_stored').value = compact;
-                document.getElementById('udp2raw_loglevel_val').value = ll;
-                if (msg) msg.innerHTML = 'Выполнено. Ожидание статуса...';
-                setTimeout(poll_status, 2000);
-                setTimeout(poll_status, 5000);
-                setTimeout(poll_status, 10000);
-                if (btn){ btn.value='Сохранить и применить'; btn.disabled=false; }
-            });
-        }, 300);
-    });
+    var msg = document.getElementById('apply_msg');
+    if (msg) msg.innerHTML = 'Сохранение...';
+
+    // Стандартный POST через start_apply.htm — httpd сохраняет nvram
+    // и вызывает action_script=restart_udp2raw через variables.c restart bits
+    var form = document.createElement('form');
+    form.method = 'POST';
+    form.action = '/start_apply.htm';
+
+    var fields = {
+        current_page: 'Advanced_udp2raw.asp',
+        next_page:    'Advanced_udp2raw.asp',
+        action_mode:  'apply',
+        action_script:'restart_udp2raw',
+        action_wait:  '5',
+        udp2raw_enable:  en,
+        udp2raw_servers: compact,
+        udp2raw_loglevel: ll
+    };
+    for (var k in fields){
+        var inp = document.createElement('input');
+        inp.type = 'hidden'; inp.name = k; inp.value = fields[k];
+        form.appendChild(inp);
+    }
+    document.body.appendChild(form);
+    form.submit();
 }
 function done_validating(action){}
 </script>
@@ -656,7 +658,7 @@ function done_validating(action){}
 </body>
 </html>
 ASPEOF
-echo "  Created Advanced_udp2raw.asp v17.0"
+echo "  Created Advanced_udp2raw.asp v18.0"
 
 ############################################################
 # 11. state.js
@@ -675,6 +677,95 @@ fi
 ############################################################
 # 12. nvram defaults
 ############################################################
+echo ">>> [11] variables.c — struct-aware patch (action_script механизм)"
+
+HTTPD_VARS="$TRUNK/user/httpd/variables.c"
+
+if [ ! -f "$HTTPD_VARS" ]; then
+    echo "  WARN: variables.c not found, skip"
+else
+    # v14.0 FIX: пишем Python в файл — нет проблем с экранированием кавычек
+    cat > /tmp/patch_udp2raw_vars.py << 'PATCHPY'
+import re, sys
+
+FILE = sys.argv[1]
+NEW_VARS = ["udp2raw_enable", "udp2raw_servers", "udp2raw_status", "udp2raw_active", "udp2raw_loglevel"]
+
+with open(FILE) as f:
+    content = f.read()
+
+if "udp2raw_enable" in content:
+    print("  Already patched:", FILE)
+    sys.exit(0)
+
+print("  Patching:", FILE)
+
+# Найти struct variable variables[]
+m = re.search(r'struct\s+variable\s+\w+\s*\[\s*\]\s*=\s*\{', content)
+if not m:
+    m = re.search(r'\bvariables\s*\[\s*\]\s*=\s*\{', content)
+if not m:
+    print("  ERROR: variables array not found")
+    sys.exit(1)
+
+arr_open = m.end() - 1
+
+# Найти закрывающую скобку массива
+depth = 0
+arr_close = None
+for i in range(arr_open, len(content)):
+    if content[i] == '{': depth += 1
+    elif content[i] == '}':
+        depth -= 1
+        if depth == 0:
+            arr_close = i
+            break
+
+if arr_close is None:
+    print("  ERROR: closing brace not found")
+    sys.exit(1)
+
+# Определить отступ из первой записи
+arr_body = content[arr_open+1:arr_close]
+ENTRY_RE = re.compile(r'^([\t ]+)\{([^}]+)\}', re.MULTILINE)
+entries = ENTRY_RE.findall(arr_body)
+if not entries:
+    print("  ERROR: no entries found")
+    sys.exit(1)
+indent = entries[0][0]
+
+# Новые записи: формат {"varname", "varname", NULL, 1}
+# 1 = ненулевые restart bits -> httpd вызовет action_script
+new_entries = ""
+for var in NEW_VARS:
+    new_entries += indent + '{"' + var + '", "' + var + '", NULL, 1},\n'
+
+# FIX: вставить ПЕРЕД {NULL,...} терминатором (если есть)
+# Иначе httpd остановится на NULL и не увидит наши переменные
+null_m = re.search(r'(\{NULL\s*,)', content[arr_open:arr_close])
+if null_m:
+    insert_pos = arr_open + null_m.start()
+    print("  Inserting BEFORE NULL terminator at offset", insert_pos)
+    new_content = content[:insert_pos] + new_entries + content[insert_pos:]
+else:
+    # Нет терминатора — вставить перед закрывающей скобкой
+    print("  No NULL terminator, inserting before closing brace")
+    before = content[:arr_close].rstrip('\n\r')
+    if before and not before.endswith(','):
+        before += ','
+    new_content = before + "\n" + new_entries + content[arr_close:]
+
+with open(FILE, 'w') as f:
+    f.write(new_content)
+
+print("  SUCCESS")
+PATCHPY
+
+    python3 /tmp/patch_udp2raw_vars.py "$HTTPD_VARS"
+    echo "  --- Verify ---"
+    grep -n "udp2raw" "$HTTPD_VARS" && echo "  VERIFY OK" || echo "  VERIFY FAILED!"
+fi
+
 echo ">>> [11] nvram defaults"
 patch_nvram_defaults() {
     local FILE="$1" LABEL="$2"
@@ -756,7 +847,7 @@ fi
 
 echo ""
 echo "============================================"
-echo "  MILLENIUM Group VPN — build ready v17.0"
+echo "  MILLENIUM Group VPN — build ready v18.0"
 echo "  1. START_LOCK берётся ДО fork (нет двойного запуска)"
 echo "  2. PID проверяется после sleep 2 (нет ложного CONNECTED)"
 echo "  3. restart убран из udp2raw-save (нет дублирования)"
