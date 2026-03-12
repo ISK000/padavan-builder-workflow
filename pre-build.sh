@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v22.0
+# MILLENIUM Group — Padavan-NG pre-build v23.0
 #
 # Основано на v16.2. Исправлены 3 бага:
 # БАГ 1: Race condition → START_LOCK берётся ДО fork
@@ -16,8 +16,8 @@ ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
 ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v22.0"
-echo "  FIX: nvram watcher watchdog, no nvram overwrite, no action_script dependency"
+echo "  MILLENIUM Group VPN — pre-build v23.0"
+echo "  FIX: /tmp/restart_udp2raw symlink (sys_script ищет в /tmp/), nvram watcher watchdog"
 echo "============================================"
 
 ############################################################
@@ -94,7 +94,7 @@ lock_release() { rm -f "$1"; }
 CMEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-common"
 
-# ─── udp2raw-save — v22.0: НЕ вызывает restart в конце ───
+# ─── udp2raw-save — v23.0: НЕ вызывает restart в конце ───
 cat > "$UDP2RAW_DIR/files/udp2raw-save" << 'SAVEOF'
 #!/bin/sh
 CFG="/etc/storage/udp2raw.conf"
@@ -121,17 +121,19 @@ if ! grep -q "### UDP2RAW AUTO START ###" "$POSTWAN" 2>/dev/null; then
 cat >> "$POSTWAN" << 'HOOK'
 
 ### UDP2RAW AUTO START ###
-if [ -f /etc/storage/udp2raw.conf ]; then
-    . /etc/storage/udp2raw.conf
-    /usr/bin/fl-vpn-watchdog start >/dev/null 2>&1 || true
-    [ "${UDP2RAW_ENABLE:-0}" = "1" ] && /sbin/restart_udp2raw >/dev/null 2>&1 &
-fi
+# Создаём /tmp/restart_udp2raw для action_script механизма httpd
+# sys_script() ищет скрипт в /tmp/<name>, не в /sbin/
+ln -sf /sbin/restart_udp2raw /tmp/restart_udp2raw 2>/dev/null || \
+    cp /sbin/restart_udp2raw /tmp/restart_udp2raw
+chmod +x /tmp/restart_udp2raw 2>/dev/null || true
+# Запускаем watchdog
+/usr/bin/fl-vpn-watchdog start >/dev/null 2>&1 || true
 ### UDP2RAW AUTO END ###
 HOOK
 chmod +x "$POSTWAN"
 fi
 /sbin/mtd_storage.sh save >/dev/null 2>&1 || true
-# v22.0 FIX: НЕ вызываем restart_udp2raw — AJAX сделает это отдельным запросом
+# v23.0 FIX: НЕ вызываем restart_udp2raw — AJAX сделает это отдельным запросом
 echo "OK"
 SAVEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-save"
@@ -183,7 +185,7 @@ esac
 CTLEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-ctl"
 
-# ─── fl-vpn-start — v22.0: lock СРАЗУ + проверка PID ───
+# ─── fl-vpn-start — v23.0: lock СРАЗУ + проверка PID ───
 cat > "$UDP2RAW_DIR/files/fl-vpn-start" << 'VPNEOF'
 #!/bin/sh
 # fl-vpn-start v22: читает nvram напрямую, не перезаписывает его
@@ -364,7 +366,7 @@ chmod +x "$UDP2RAW_DIR/files/fl-vpn-status"
 echo "  Scripts OK"
 
 ############################################################
-# 5. restart_udp2raw — v22.0: START_LOCK ДО fork
+# 5. restart_udp2raw — v23.0: START_LOCK ДО fork
 ############################################################
 echo ">>> [5] restart_udp2raw"
 mkdir -p "$ROMFS_SBIN"
@@ -710,7 +712,7 @@ function done_validating(action){}
 </body>
 </html>
 ASPEOF
-echo "  Created Advanced_udp2raw.asp v22.0"
+echo "  Created Advanced_udp2raw.asp v23.0"
 
 ############################################################
 # 11. state.js
@@ -899,7 +901,7 @@ fi
 
 echo ""
 echo "============================================"
-echo "  MILLENIUM Group VPN — build ready v22.0"
+echo "  MILLENIUM Group VPN — build ready v23.0"
 echo "  1. START_LOCK берётся ДО fork (нет двойного запуска)"
 echo "  2. PID проверяется после sleep 2 (нет ложного CONNECTED)"
 echo "  3. restart убран из udp2raw-save (нет дублирования)"
