@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ############################################################
-# MILLENIUM Group — Padavan-NG pre-build v23.0
+# MILLENIUM Group — Padavan-NG pre-build v24.0
 #
 # Основано на v16.2. Исправлены 3 бага:
 # БАГ 1: Race condition → START_LOCK берётся ДО fork
@@ -16,8 +16,8 @@ ROMFS_STORAGE="$TRUNK/romfs/etc/storage"
 ROMFS_SBIN="$TRUNK/romfs/sbin"
 
 echo "============================================"
-echo "  MILLENIUM Group VPN — pre-build v23.0"
-echo "  FIX: /tmp/restart_udp2raw symlink (sys_script ищет в /tmp/), nvram watcher watchdog"
+echo "  MILLENIUM Group VPN — pre-build v24.0"
+echo "  FIX: variables_General[] patch, action_mode=" Apply ", sid_list=General, /tmp symlink"
 echo "============================================"
 
 ############################################################
@@ -94,7 +94,7 @@ lock_release() { rm -f "$1"; }
 CMEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-common"
 
-# ─── udp2raw-save — v23.0: НЕ вызывает restart в конце ───
+# ─── udp2raw-save — v24.0: НЕ вызывает restart в конце ───
 cat > "$UDP2RAW_DIR/files/udp2raw-save" << 'SAVEOF'
 #!/bin/sh
 CFG="/etc/storage/udp2raw.conf"
@@ -133,7 +133,7 @@ HOOK
 chmod +x "$POSTWAN"
 fi
 /sbin/mtd_storage.sh save >/dev/null 2>&1 || true
-# v23.0 FIX: НЕ вызываем restart_udp2raw — AJAX сделает это отдельным запросом
+# v24.0 FIX: НЕ вызываем restart_udp2raw — AJAX сделает это отдельным запросом
 echo "OK"
 SAVEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-save"
@@ -185,7 +185,7 @@ esac
 CTLEOF
 chmod +x "$UDP2RAW_DIR/files/udp2raw-ctl"
 
-# ─── fl-vpn-start — v23.0: lock СРАЗУ + проверка PID ───
+# ─── fl-vpn-start — v24.0: lock СРАЗУ + проверка PID ───
 cat > "$UDP2RAW_DIR/files/fl-vpn-start" << 'VPNEOF'
 #!/bin/sh
 # fl-vpn-start v22: читает nvram напрямую, не перезаписывает его
@@ -366,7 +366,7 @@ chmod +x "$UDP2RAW_DIR/files/fl-vpn-status"
 echo "  Scripts OK"
 
 ############################################################
-# 5. restart_udp2raw — v23.0: START_LOCK ДО fork
+# 5. restart_udp2raw — v24.0: START_LOCK ДО fork
 ############################################################
 echo ">>> [5] restart_udp2raw"
 mkdir -p "$ROMFS_SBIN"
@@ -602,12 +602,15 @@ function applyRule(){
 
     // v19: AJAX POST — остаёмся на странице, не делаем navigate
     // start_apply.htm сохраняет nvram через variables.c и вызывает restart_udp2raw
+    // v24 FIX: action_mode должен быть ' Apply ' (с пробелами и заглавной A)
+    // sid_list: 'General' — сервис в svcLinks[], куда вставлены наши переменные
     $j.post('/start_apply.htm', {
         current_page:     'Advanced_udp2raw.asp',
         next_page:        'Advanced_udp2raw.asp',
-        action_mode:      'apply',
+        action_mode:      ' Apply ',
         action_script:    'restart_udp2raw',
         action_wait:      '3',
+        sid_list:         'General',
         udp2raw_enable:   en,
         udp2raw_servers:  compact,
         udp2raw_loglevel: ll
@@ -712,7 +715,7 @@ function done_validating(action){}
 </body>
 </html>
 ASPEOF
-echo "  Created Advanced_udp2raw.asp v23.0"
+echo "  Created Advanced_udp2raw.asp v24.0"
 
 ############################################################
 # 11. state.js
@@ -754,17 +757,18 @@ if "udp2raw_enable" in content:
 
 print("  Patching:", FILE)
 
-# Найти struct variable variables[]
-m = re.search(r'struct\s+variable\s+\w+\s*\[\s*\]\s*=\s*\{', content)
+# v24 FIX: вставляем строго в variables_General[]
+# Это svcLink "General" — sid_list в AJAX POST должен быть "General"
+# Первый попавшийся массив мог быть variables_Language[] с {0,0,0,0} терминатором
+# который блокировал итерацию до наших переменных
+m = re.search(r'struct\s+variable\s+variables_General\s*\[\s*\]\s*=\s*\{', content)
 if not m:
-    m = re.search(r'\bvariables\s*\[\s*\]\s*=\s*\{', content)
-if not m:
-    print("  ERROR: variables array not found")
+    print("  ERROR: variables_General[] not found")
     sys.exit(1)
 
 arr_open = m.end() - 1
 
-# Найти закрывающую скобку массива
+# Найти закрывающую скобку массива (depth tracking)
 depth = 0
 arr_close = None
 for i in range(arr_open, len(content)):
@@ -788,26 +792,21 @@ if not entries:
     sys.exit(1)
 indent = entries[0][0]
 
-# Новые записи: формат {"varname", "varname", NULL, 1}
-# 1 = ненулевые restart bits -> httpd вызовет action_script
+# Новые записи: event_mask=1 (ненулевой) -> httpd вызовет action_script
 new_entries = ""
 for var in NEW_VARS:
     new_entries += indent + '{"' + var + '", "' + var + '", NULL, 1},\n'
 
-# FIX: вставить ПЕРЕД {NULL,...} терминатором (если есть)
-# Иначе httpd остановится на NULL и не увидит наши переменные
-null_m = re.search(r'(\{NULL\s*,)', content[arr_open:arr_close])
+# v24 FIX: ищем {0,0,0,0} терминатор (такой формат в этом файле, не {NULL,})
+# Вставляем ПЕРЕД ним — иначе httpd стопится и не видит наши переменные
+null_m = re.search(r'\{0\s*,\s*0\s*,\s*0\s*,\s*0\s*\}', content[arr_open:arr_close])
 if null_m:
     insert_pos = arr_open + null_m.start()
-    print("  Inserting BEFORE NULL terminator at offset", insert_pos)
+    print("  Inserting BEFORE {0,0,0,0} terminator at offset", insert_pos)
     new_content = content[:insert_pos] + new_entries + content[insert_pos:]
 else:
-    # Нет терминатора — вставить перед закрывающей скобкой
-    print("  No NULL terminator, inserting before closing brace")
-    before = content[:arr_close].rstrip('\n\r')
-    if before and not before.endswith(','):
-        before += ','
-    new_content = before + "\n" + new_entries + content[arr_close:]
+    print("  ERROR: {0,0,0,0} terminator not found in variables_General[]")
+    sys.exit(1)
 
 with open(FILE, 'w') as f:
     f.write(new_content)
@@ -901,7 +900,7 @@ fi
 
 echo ""
 echo "============================================"
-echo "  MILLENIUM Group VPN — build ready v23.0"
+echo "  MILLENIUM Group VPN — build ready v24.0"
 echo "  1. START_LOCK берётся ДО fork (нет двойного запуска)"
 echo "  2. PID проверяется после sleep 2 (нет ложного CONNECTED)"
 echo "  3. restart убран из udp2raw-save (нет дублирования)"
